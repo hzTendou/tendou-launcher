@@ -1,0 +1,108 @@
+[DEBUG-ATLAS] 1. Before common_init_from_params
+0.01.786.224 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+0.02.257.510 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.17.713.463 I cmn          init: llama threadpool init, n_threads = 14
+[DEBUG-ATLAS] 2. After common_init_from_params, res=0000028C04C71DD0
+0.17.714.078 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] Speculative Engine ACTIVE: types=none,draft-mtp draft_n=1 mtws=0 dft_ctx=yes
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=6600MB RAM=6144MB NVMe=BackingStore
+[ATLAS] product_gpu_mode: VRAM Max Capacity ACTIVE (Layers 0-1 MoE [1024 exps] + 48 Attn + 48 ShExp in GDDR6)
+[ATLAS] optimization_flags: mtws=0 mtp=ram(Q4_K_M, loc=ram, n=1) fast_cb=1 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: def fibonacci(n):
+[RESPONSE]: [ATLAS_BATCH_CHECK] pos=3 batched=198 sequential=198 max_abs_delta=1.042580 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=4 batched=262 sequential=262 max_abs_delta=0.488962 sequential_margin=0.000000
+
+   [ATLAS_BATCH_CHECK] pos=5 batched=413 sequential=413 max_abs_delta=0.521588 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=6 batched=307 sequential=307 max_abs_delta=1.555215 sequential_margin=0.000000
+ if n[ATLAS_BATCH_CHECK] pos=7 batched=2564 sequential=2564 max_abs_delta=0.318865 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=8 batched=220 sequential=220 max_abs_delta=0.449910 sequential_margin=0.000000
+ <= [ATLAS_BATCH_CHECK] pos=9 batched=16 sequential=16 max_abs_delta=0.537514 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=10 batched=25 sequential=25 max_abs_delta=0.629664 sequential_margin=0.000000
+1:[ATLAS_BATCH_CHECK] pos=11 batched=198 sequential=198 max_abs_delta=0.739904 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=12 batched=285 sequential=285 max_abs_delta=0.512734 sequential_margin=0.000000
+
+       [ATLAS_BATCH_CHECK] pos=13 batched=460 sequential=460 max_abs_delta=0.884244 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=14 batched=307 sequential=307 max_abs_delta=0.847202 sequential_margin=0.000000
+ return n[ATLAS_BATCH_CHECK] pos=15 batched=198 sequential=198 max_abs_delta=0.454496 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=16 batched=262 sequential=262 max_abs_delta=1.350937 sequential_margin=0.000000
+
+   [ATLAS_BATCH_CHECK] pos=17 batched=745 sequential=745 max_abs_delta=0.762358 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=18 batched=25 sequential=25 max_abs_delta=1.853451 sequential_margin=0.000000
+ else:[ATLAS_BATCH_CHECK] pos=19 batched=198 sequential=198 max_abs_delta=1.138395 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=20 batched=285 sequential=285 max_abs_delta=1.065111 sequential_margin=0.000000
+
+       [ATLAS_BATCH_CHECK] pos=21 batched=460 sequential=460 max_abs_delta=0.805903 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=22 batched=73111 sequential=73111 max_abs_delta=0.690795 sequential_margin=0.000000
+ return fibonacci[ATLAS_BATCH_CHECK] pos=23 batched=1393 sequential=1393 max_abs_delta=1.609128 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=24 batched=12 sequential=12 max_abs_delta=0.696980 sequential_margin=0.000000
+(n-[ATLAS_BATCH_CHECK] pos=25 batched=16 sequential=16 max_abs_delta=1.071286 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=26 batched=8 sequential=8 max_abs_delta=0.956212 sequential_margin=0.000000
+1)[ATLAS_BATCH_CHECK] pos=27 batched=478 sequential=478 max_abs_delta=1.309087 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=28 batched=73111 sequential=73111 max_abs_delta=1.109790 sequential_margin=0.000000
+ + fibonacci[ATLAS_BATCH_CHECK] pos=29 batched=1393 sequential=1393 max_abs_delta=0.808919 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=30 batched=1393 sequential=1393 max_abs_delta=2.094947 sequential_margin=0.000000
+(n[ATLAS_BATCH_CHECK] pos=30 batched=12 sequential=12 max_abs_delta=0.691768 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=31 batched=30 sequential=12 max_abs_delta=3.561341 sequential_margin=1.323951
+-[ATLAS_BATCH_CHECK] pos=31 batched=17 sequential=17 max_abs_delta=0.858676 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=32 batched=8 sequential=8 max_abs_delta=0.622285 sequential_margin=0.000000
+2)[ATLAS_BATCH_CHECK] pos=33 batched=271 sequential=271 max_abs_delta=0.759134 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=34 batched=727 sequential=727 max_abs_delta=0.819609 sequential_margin=0.000000
+
+
+def[ATLAS_BATCH_CHECK] pos=35 batched=1822 sequential=1822 max_abs_delta=1.222485 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=36 batched=697 sequential=697 max_abs_delta=0.525949 sequential_margin=0.000000
+ main[ATLAS_BATCH_CHECK] pos=36 batched=4406 sequential=4406 max_abs_delta=1.053012 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=37 batched=198 sequential=198 max_abs_delta=1.255403 sequential_margin=0.000000
+():
+[ATLAS_BATCH_CHECK] pos=38 batched=262 sequential=262 max_abs_delta=0.627052 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=39 batched=307 sequential=307 max_abs_delta=0.601965 sequential_margin=0.000000
+    n[ATLAS_BATCH_CHECK] pos=40 batched=283 sequential=283 max_abs_delta=0.765890 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=41 batched=514 sequential=514 max_abs_delta=1.053738 sequential_margin=0.000000
+ = int[ATLAS_BATCH_CHECK] pos=42 batched=5216 sequential=5216 max_abs_delta=1.581880 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=43 batched=437 sequential=437 max_abs_delta=1.132867 sequential_margin=0.000000
+(input("[ATLAS_BATCH_CHECK] pos=44 batched=43970 sequential=43970 max_abs_delta=0.753387 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=45 batched=279 sequential=279 max_abs_delta=0.997794 sequential_margin=0.000000
+Digite[ATLAS_BATCH_CHECK] pos=45 batched=264 sequential=4297 max_abs_delta=0.681955 sequential_margin=0.061176
+[ATLAS_BATCH_CHECK] pos=46 batched=13711 sequential=13711 max_abs_delta=0.759660 sequential_margin=0.000000
+ a[ATLAS_BATCH_CHECK] pos=46 batched=94808 sequential=94808 max_abs_delta=0.632650 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=47 batched=428 sequential=428 max_abs_delta=0.735275 sequential_margin=0.000000
+ posição[ATLAS_BATCH_CHECK] pos=47 batched=184537 sequential=184537 max_abs_delta=0.554814 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=48 batched=184519 sequential=184519 max_abs_delta=0.716931 sequential_margin=0.000000
+ desej[ATLAS_BATCH_CHECK] pos=48 batched=2499 sequential=2499 max_abs_delta=0.686728 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=49 batched=25 sequential=25 max_abs_delta=0.705934 sequential_margin=0.000000
+ada:[ATLAS_BATCH_CHECK] pos=50 batched=77405 sequential=77405 max_abs_delta=0.750539 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=51 batched=198 sequential=198 max_abs_delta=0.778220 sequential_margin=0.000000
+ "))
+[ATLAS_BATCH_CHECK] pos=52 batched=262 sequential=262 max_abs_delta=0.676578 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=53 batched=1133 sequential=1133 max_abs_delta=0.880079 sequential_margin=0.000000
+    print[ATLAS_BATCH_CHECK] pos=54 batched=925 sequential=925 max_abs_delta=0.661187 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=55 batched=564 sequential=564 max_abs_delta=1.496016 sequential_margin=0.000000
+(fib[ATLAS_BATCH_CHECK] pos=56 batched=38044 sequential=38044 max_abs_delta=1.412169 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=57 batched=1393 sequential=1393 max_abs_delta=1.693826 sequential_margin=0.000000
+onacci(n[ATLAS_BATCH_CHECK] pos=58 batched=578 sequential=578 max_abs_delta=0.520482 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=59 batched=271 sequential=271 max_abs_delta=0.556012 sequential_margin=0.000000
+))
+
+[ATLAS_BATCH_CHECK] pos=60 batched=3689 sequential=3689 max_abs_delta=0.814494 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=61 batched=1822 sequential=1822 max_abs_delta=3.983977 sequential_margin=0.000000
+main[ATLAS_BATCH_CHECK] pos=61 batched=363 sequential=363 max_abs_delta=1.436073 sequential_margin=0.000000
+[ATLAS_BATCH_CHECK] pos=62 batched=248044 sequential=248044 max_abs_delta=1.062284 sequential_margin=0.000000
+()<|endoftext|>
+[ATLAS_RESULT] {"accepted_tokens":26,"decode_span_ms":46357.9058,"draft_ms":1501.8235999999997,"draft_tokens":34,"failed":false,"generated_tokens":60,"native_k":10,"prompt_tokens":4,"request_ms":49600.0791,"token_ids":[198,262,413,307,2564,220,16,25,198,285,460,307,198,262,745,25,198,285,460,73111,1393,12,16,8,478,73111,1393,12,17,8,271,727,1822,4406,198,262,307,283,514,5216,437,43970,264,94808,184537,2499,25,77405,198,262,1133,925,564,38044,1393,578,271,3689,363,248044],"ttft_ms":3232.7608,"verify_ms":23014.9608}
+
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  17107.7 ms
+[ATLAS] Prompt:   4 tokens / 1.634 s = 2.45 TPS
+[ATLAS] Generate: 60 tokens / 47.966 s = 1.25 TPS
+[ATLAS] Router events: 0 decode / 0 warmup
+Quality Floor Status:  NOT_EVALUATED (requires external task accuracy >= 85.0%)
+Active Router Width:   10
+=================================================================
+

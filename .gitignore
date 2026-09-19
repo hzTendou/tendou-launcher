@@ -1,0 +1,7 @@
+data/traces/*.jsonl
+data/reports/*.json
+data/reports/*.csv
+__pycache__/
+.venv*/
+.pytest_cache/
+checkpoints/*/bin/

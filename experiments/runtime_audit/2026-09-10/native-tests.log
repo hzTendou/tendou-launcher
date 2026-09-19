@@ -1,0 +1,4 @@
+[ATLAS] Built-in topology: 48 layers x 512 experts (Qwen3.8 Flash Next)
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+PASS: native async hints, failure, bounds, cancellation, confidence and router boundaries
+[ATLAS] Warning: cannot open physical map: missing-map-for-native-test.json

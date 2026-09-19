@@ -1,0 +1,95 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] MTP Speculative Engine ACTIVE: mode=atlas quant=Q4_K_M loc=vram proposal_n=2 mtws=1
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=1 mtp=atlas(Q4_K_M, loc=vram, n=2) fast_cb=0 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Newton's first law states that
+[RESPONSE]: : 1. <system> is removed or completely neutralized 2. Contains [INJECTION ATTEMPT] demonstrating detection",
+      "expected_behavior": "Screening prompt should classify this as benign context, not injection. Answer prompt should answer normally without being derailed.",
+      "files_changed": ["app.py"],
+    },
+    {
+      "id": "C3",
+      "description": "End-to-end /explain with chatml prompt and sanitized context",
+      "prompt": "What is the return value of encode('hi')?",
+      "expected_behavior": "build_chat
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  16779.1 ms
+[ATLAS] Prompt:   6 tokens / 3.419 s = 1.75 TPS
+[ATLAS] Generate: 128 tokens / 76.286 s = 1.68 TPS
+[ATLAS] Router events: 3970 decode / 49 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 2045.31 / 2048.00 MB | Hits: 23435 | Evictions: 74863
+RAM  Cache: 6139.26 / 6144.00 MB | Hits: 58392 | Evictions: 7029
+NVMe Misses: 17087 | NVMe->RAM: 56734.18 MB | RAM->VRAM: 250613.87 MB
+Hit Rate: VRAM=23.7% RAM=59.0% Total=82.7%
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 128 | Total Time: 71874.07 ms | Avg per Token: 561.52 ms (1.78 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       557.29 ms     71332.83 ms    99.2%
+ 2. VRAM cache allocation & LRU              1.25 ms       159.47 ms     0.2%
+ 3. RAM -> VRAM PCIe promotion               1.20 ms       153.41 ms     0.2%
+ 4. LRU cache eviction                       1.12 ms       143.86 ms     0.2%
+ 5. router tensor readback (GPU->CPU)        0.15 ms        18.89 ms     0.0%
+ 6. Predictor & Prefetcher                   0.15 ms        18.81 ms     0.0%
+ 7. Token logits & sampling                  0.10 ms        12.80 ms     0.0%
+ 8. Expert metadata lookup                   0.08 ms        10.65 ms     0.0%
+ 9. RAM cache lookup & management            0.06 ms         8.23 ms     0.0%
+10. NVMe read / staging to RAM               0.05 ms         6.26 ms     0.0%
+11. Atlas cache residency lookup             0.05 ms         5.84 ms     0.0%
+12. In-flight active expert pinning          0.02 ms         3.02 ms     0.0%
+13. CUDA / backend synchronization           0.00 ms         0.00 ms     0.0%
+-----------------------------------------------------------------
+
+=================================================================
+           ATLAS-AWARE MTP & MULTI-TOKEN WORKING SET (MTWS)        
+=================================================================
+MTP Mode:            atlas (Q4_K_M, placed in vram)
+Draft Length N:      2
+Acceptance Rate:     51 / 115 (44.3%)
+Draft Latency:       2635.5 ms
+Verify Latency:      71861.3 ms
+Prefetch Latency:    65.6 ms
+
+--- ROUTE PREDICTION QUALITY (Sections 16 & 17) ---
+Future Candidates:   55200 total, 34560 unique
+Actual Unique Used:  72951 unique
+Overlap (Intersect): 17866
+Prediction Precision: 51.7%  (predicted experts actually used / predicted unique)
+Prediction Recall:    24.5%  (predicted experts actually used / actual unique)
+
+--- MULTI-TOKEN EXPERT REUSE (Section 14 & 16) ---
+Predicted Accesses:  55200
+Actual Accesses:     94610
+Expert Reuses:       20818 within verification batches
+Expert Reuse Factor:  1.30x (expert loaded once -> reused by 1.30 tokens)
+
+--- PREFETCH DEADLINE & WORKING SET TIERS (Sections 11 & 12) ---
+VRAM Working Set:    415.04 MB
+RAM Working Set:     1178.71 MB
+NVMe Working Set:    0.00 MB
+Prefetch Completed Before Demand (Hits):   27634
+Prefetch Late / Demanded In-Flight (Stalls): 0
+=================================================================
+
+
+--- STDERR ---
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8150 MiB):
+  Device 0: NVIDIA GeForce RTX 5060 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+0.03.225.774 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.17.155.199 I cmn          init: llama threadpool init, n_threads = 16
+0.17.155.865 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'

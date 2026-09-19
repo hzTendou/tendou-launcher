@@ -1,0 +1,97 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] MTP Speculative Engine ACTIVE: mode=vram quant=Q4_K_M loc=vram proposal_n=2 mtws=0
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=0 mtp=vram(Q4_K_M, loc=vram, n=2) fast_cb=0 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Newton's first law states that
+[RESPONSE]:  if the net force on an object is zero, the object moves with a constant velocity. Does this mean that constant velocity implies no net force? Is the converse of the first law true?
+
+<think>
+
+</think>
+
+Based on logical deduction and Newtonian mechanics, here is the step-by-step analysis of your question.
+
+### Logical Deduction
+
+To answer this, we must look at Newton's Second Law of Motion, which provides the mathematical relationship between force, mass, and motion.
+
+**1. The Mathematical Definition**
+Newton's First Law is conceptually a special case of Newton's Second Law. The Second Law is expressed as
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  16824.8 ms
+[ATLAS] Prompt:   6 tokens / 3.226 s = 1.86 TPS
+[ATLAS] Generate: 128 tokens / 53.087 s = 2.41 TPS
+[ATLAS] Router events: 2953 decode / 49 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 2045.31 / 2048.00 MB | Hits: 22223 | Evictions: 57062
+RAM  Cache: 6142.58 / 6144.00 MB | Hits: 45018 | Evictions: 4620
+NVMe Misses: 12660 | NVMe->RAM: 42035.16 MB | RAM->VRAM: 191508.98 MB
+Hit Rate: VRAM=27.8% RAM=56.3% Total=84.2%
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 128 | Total Time: 51327.95 ms | Avg per Token: 401.00 ms (2.49 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       397.63 ms     50897.20 ms    99.2%
+ 2. VRAM cache allocation & LRU              0.98 ms       125.02 ms     0.2%
+ 3. RAM -> VRAM PCIe promotion               0.95 ms       121.46 ms     0.2%
+ 4. LRU cache eviction                       0.89 ms       113.69 ms     0.2%
+ 5. Predictor & Prefetcher                   0.12 ms        15.75 ms     0.0%
+ 6. router tensor readback (GPU->CPU)        0.11 ms        13.99 ms     0.0%
+ 7. Token logits & sampling                  0.10 ms        12.80 ms     0.0%
+ 8. Expert metadata lookup                   0.07 ms         8.64 ms     0.0%
+ 9. RAM cache lookup & management            0.06 ms         7.06 ms     0.0%
+10. Atlas cache residency lookup             0.04 ms         5.35 ms     0.0%
+11. NVMe read / staging to RAM               0.04 ms         4.59 ms     0.0%
+12. In-flight active expert pinning          0.02 ms         2.39 ms     0.0%
+13. CUDA / backend synchronization           0.00 ms         0.00 ms     0.0%
+-----------------------------------------------------------------
+
+=================================================================
+           ATLAS-AWARE MTP & MULTI-TOKEN WORKING SET (MTWS)        
+=================================================================
+MTP Mode:            vram (Q4_K_M, placed in vram)
+Draft Length N:      2
+Acceptance Rate:     70 / 104 (67.3%)
+Draft Latency:       1567.1 ms
+Verify Latency:      51315.2 ms
+Prefetch Latency:    0.0 ms
+
+--- ROUTE PREDICTION QUALITY (Sections 16 & 17) ---
+Future Candidates:   0 total, 0 unique
+Actual Unique Used:  0 unique
+Overlap (Intersect): 0
+Prediction Precision: 0.0%  (predicted experts actually used / predicted unique)
+Prediction Recall:    0.0%  (predicted experts actually used / actual unique)
+
+--- MULTI-TOKEN EXPERT REUSE (Section 14 & 16) ---
+Predicted Accesses:  0
+Actual Accesses:     78870
+Expert Reuses:       21709 within verification batches
+
+--- PREFETCH DEADLINE & WORKING SET TIERS (Sections 11 & 12) ---
+VRAM Working Set:    0.00 MB
+RAM Working Set:     0.00 MB
+NVMe Working Set:    0.00 MB
+Prefetch Completed Before Demand (Hits):   0
+Prefetch Late / Demanded In-Flight (Stalls): 0
+=================================================================
+
+
+--- STDERR ---
+0.03.386.783 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.17.247.287 I cmn          init: llama threadpool init, n_threads = 16
+0.17.247.889 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'

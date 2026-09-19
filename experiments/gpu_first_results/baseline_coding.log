@@ -1,0 +1,90 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] Adaptive-K Expert Pruning ACTIVE: K=2 (nominal=10, compute_reduction=80.0%)
+[ATLAS] Speculative Engine ACTIVE: types=ngram-simple draft_n=12 mtws=0 dft_ctx=no
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=0 mtp=off(Q4_K_M, loc=ram, n=3) fast_cb=1 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Write a Python function to find the longest palindromic substring:
+[RESPONSE]: 
+
+# 2345, Medium: The Longest Word in a Given Dictionary
+import operator
+import re
+
+
+by = function = {}
+
+
+def longest_palindbyword_1(s):
+    """
+	(str
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  13278.3 ms
+[ATLAS] Prompt:   14 tokens / 1.398 s = 10.02 TPS
+[ATLAS] Generate: 48 tokens / 6.245 s = 7.69 TPS
+[ATLAS] Router events: 0 decode / 0 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 0.00 / 2048.00 MB | Hits: 0 | Evictions: 0
+RAM  Cache: 0.00 / 6144.00 MB | Hits: 0 | Evictions: 0
+NVMe Misses: 0 | NVMe->RAM: 0.00 MB | RAM->VRAM: 0.00 MB
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 48 | Total Time: 6099.54 ms | Avg per Token: 127.07 ms (7.87 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       126.97 ms      6094.74 ms    99.9%
+ 2. Token logits & sampling                  0.10 ms         4.80 ms     0.1%
+ 3. CUDA / backend synchronization           0.00 ms         0.00 ms     0.0%
+ 4. router tensor readback (GPU->CPU)        0.00 ms         0.00 ms     0.0%
+ 5. RAM -> VRAM PCIe promotion               0.00 ms         0.00 ms     0.0%
+ 6. NVMe read / staging to RAM               0.00 ms         0.00 ms     0.0%
+ 7. RAM cache lookup & management            0.00 ms         0.00 ms     0.0%
+ 8. VRAM cache allocation & LRU              0.00 ms         0.00 ms     0.0%
+ 9. LRU cache eviction                       0.00 ms         0.00 ms     0.0%
+10. Predictor & Prefetcher                   0.00 ms         0.00 ms     0.0%
+11. In-flight active expert pinning          0.00 ms         0.00 ms     0.0%
+12. Expert metadata lookup                   0.00 ms         0.00 ms     0.0%
+13. Atlas cache residency lookup             0.00 ms         0.00 ms     0.0%
+-----------------------------------------------------------------
+
+=================================================================
+           ATLAS ENGINE V1 — QUALITY & SPEED CONTROLLER REPORT   
+=================================================================
+Target Quality Floor:  0.85 (Nominal K=10, Active K=2)
+Host Staging Pool:     668 MB pinned buffer (ACTIVE)
+MoE Layer Stride:      1 (Active MoE: FULL 48 LAYERS)
+Boost Engine Status:   ACTIVE (Target: >=15 TPS Decode, >=18 TPS Prefill, Floor >=80%)
+Prefetch Lead / Horiz: 1 layers
+Expert Cost Model:     DYNAMIC (GPU Hot Cache=0.05ms, Async H2D=0.42ms, CPU AVX2=3.30ms)
+Grouped-GEMM Pipeline: 2 concurrent groups | 2 CUDA streams | Async H2D=ENABLED
+Stream Task Dispatch:  Total Invocations=0 | Grouped Batches=0 [S0=0, S1=0, S2=0]
+Estimated Quality:     95.0%
+Repetition Score:      100.0%
+Entropy Score:         87.5%
+Quality Floor Status:  PASSED (Quality Floor Maintained)
+=================================================================
+
+
+--- STDERR ---
+[DEBUG-ATLAS] 1. Before common_init_from_params
+0.01.627.070 W common_fit_params: failed to fit params to free device memory: model_params::tensor_buft_overrides already set by user, abort
+0.02.042.737 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.13.769.726 I cmn          init: llama threadpool init, n_threads = 14
+[DEBUG-ATLAS] 2. After common_init_from_params, res=0000028E18D470C0
+[MMID_PROF #0] quant=0 us, barrier=2 us, gemm=925 us, total=927 us, nr0=640, ne00=2560
+[MMID_PROF #1] quant=0 us, barrier=1 us, gemm=1014 us, total=1015 us, nr0=640, ne00=2560
+[MMID_PROF #2] quant=0 us, barrier=1 us, gemm=913 us, total=914 us, nr0=2560, ne00=640
+[MMID_PROF #3] quant=0 us, barrier=2 us, gemm=51 us, total=53 us, nr0=640, ne00=2560
+[MMID_PROF #4] quant=0 us, barrier=3 us, gemm=46 us, total=49 us, nr0=640, ne00=2560

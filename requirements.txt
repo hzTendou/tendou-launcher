@@ -1,0 +1,21 @@
+# Atlas Engine V1 — Python Package Requirements
+# Tested and verified on Python 3.12 (Windows x86_64)
+
+# --- Core Server Runtime & OpenAI-Compatible API ---
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.5
+httpx==0.28.1
+openai==3.8.0
+
+# --- Hardware & System Profiling ---
+psutil==7.2.2
+
+# --- GGUF & Model Utilities ---
+numpy==2.5.2
+gguf==0.19.0
+huggingface-hub==1.27.0
+
+# --- Testing & Test Runner ---
+pytest==9.1.1
+pytest-asyncio==1.4.0

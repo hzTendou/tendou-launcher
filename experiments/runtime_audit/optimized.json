@@ -1,0 +1,190 @@
+{
+  "exe": "C:\\Users\\Ali\\WebProjects\\atlas-engine-v1\\llama.cpp\\build\\bin\\Release\\llama-atlas-engine.exe",
+  "exe_sha256": "3faf1e1c198b365de93b11f127b2601daff2487735e38ce346174f2de112ef19",
+  "native_router": true,
+  "engine_args": [],
+  "context": 2048,
+  "max_tokens": 16,
+  "temperature": 0,
+  "startup_s": 23.400527499999953,
+  "results": [
+    {
+      "case": "math",
+      "repetition": 0,
+      "ttft_ms": 11424.058900000091,
+      "elapsed_s": 15.188239600000088,
+      "effective_tps": 0.19752124531930498,
+      "decode_tps": 0.795659170005721,
+      "token_ids": [
+        18,
+        17,
+        18
+      ],
+      "text": "323",
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 4,
+        "elapsed_ms": 15181.3422,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-e292406c",
+        "prompt_cache_bytes": 119980844,
+        "prompt_tokens": 28,
+        "text": "323<|im_end|>",
+        "ttft_ms": 11401.9649
+      }
+    },
+    {
+      "case": "math",
+      "repetition": 1,
+      "ttft_ms": 122.99989999974059,
+      "elapsed_s": 3.08238799999981,
+      "effective_tps": 0.9732713727149811,
+      "decode_tps": 0.8866324683656608,
+      "token_ids": [
+        18,
+        17,
+        18
+      ],
+      "text": "323",
+      "done": {
+        "cached_prompt_tokens": 28,
+        "completion_tokens": 4,
+        "elapsed_ms": 3077.7554,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-803394b7",
+        "prompt_cache_bytes": 119980844,
+        "prompt_tokens": 28,
+        "text": "323<|im_end|>",
+        "ttft_ms": 118.4518
+      }
+    },
+    {
+      "case": "code",
+      "repetition": 0,
+      "ttft_ms": 14383.026900000004,
+      "elapsed_s": 30.759812199999942,
+      "effective_tps": 0.5201592225585835,
+      "decode_tps": 0.9160778683044013,
+      "token_ids": [
+        760,
+        7258,
+        1510,
+        27379,
+        2477,
+        18,
+        11,
+        220,
+        16,
+        11,
+        220,
+        17,
+        2387,
+        63,
+        4523,
+        25
+      ],
+      "text": "The expression `sorted([3, 1, 2])` returns:",
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 16,
+        "elapsed_ms": 30756.372,
+        "event": "done",
+        "finish_reason": "length",
+        "id": "req-afe25170",
+        "prompt_cache_bytes": 119980844,
+        "prompt_tokens": 28,
+        "text": "The expression `sorted([3, 1, 2])` returns:",
+        "ttft_ms": 14382.4016
+      }
+    },
+    {
+      "case": "code",
+      "repetition": 1,
+      "ttft_ms": 371.8432999999095,
+      "elapsed_s": 16.66652150000027,
+      "effective_tps": 0.9600083616728146,
+      "decode_tps": 0.9205916711407801,
+      "token_ids": [
+        760,
+        7258,
+        1510,
+        27379,
+        2477,
+        18,
+        11,
+        220,
+        16,
+        11,
+        220,
+        17,
+        2387,
+        63,
+        4523,
+        25
+      ],
+      "text": "The expression `sorted([3, 1, 2])` returns:",
+      "done": {
+        "cached_prompt_tokens": 28,
+        "completion_tokens": 16,
+        "elapsed_ms": 16661.3,
+        "event": "done",
+        "finish_reason": "length",
+        "id": "req-dbae315d",
+        "prompt_cache_bytes": 119980844,
+        "prompt_tokens": 28,
+        "text": "The expression `sorted([3, 1, 2])` returns:",
+        "ttft_ms": 367.2547
+      }
+    },
+    {
+      "case": "logic",
+      "repetition": 0,
+      "ttft_ms": 17837.978199999725,
+      "elapsed_s": 19.455160899999555,
+      "effective_tps": 0.051400243109787025,
+      "decode_tps": null,
+      "token_ids": [
+        9175
+      ],
+      "text": "Yes",
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 19450.8491,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-1004aa59",
+        "prompt_cache_bytes": 120183884,
+        "prompt_tokens": 34,
+        "text": "Yes<|im_end|>",
+        "ttft_ms": 17834.0832
+      }
+    },
+    {
+      "case": "logic",
+      "repetition": 1,
+      "ttft_ms": 103.5544999999729,
+      "elapsed_s": 0.40675270000019736,
+      "effective_tps": 2.4584962804168597,
+      "decode_tps": null,
+      "token_ids": [
+        9175
+      ],
+      "text": "Yes",
+      "done": {
+        "cached_prompt_tokens": 34,
+        "completion_tokens": 2,
+        "elapsed_ms": 404.5244,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-ff408810",
+        "prompt_cache_bytes": 120183884,
+        "prompt_tokens": 34,
+        "text": "Yes<|im_end|>",
+        "ttft_ms": 101.4241
+      }
+    }
+  ]
+}

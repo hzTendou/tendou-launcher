@@ -1,0 +1,65 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] Adaptive-K Expert Pruning ACTIVE: K=4 (nominal=10, compute_reduction=60.0%)
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=0 mtp=off(Q4_K_M, loc=ram, n=3) fast_cb=0 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Newton's first law states that
+[RESPONSE]:  an object in motion will continue moving at a constant velocity unless acted upon by a net external force. However, when a ball rolls across a horizontal surface, it
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  13942.9 ms
+[ATLAS] Prompt:   6 tokens / 1.693 s = 3.54 TPS
+[ATLAS] Generate: 32 tokens / 6.607 s = 4.84 TPS
+[ATLAS] Router events: 1536 decode / 48 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 2045.31 / 2048.00 MB | Hits: 7941 | Evictions: 3107
+RAM  Cache: 4993.75 / 6144.00 MB | Hits: 1603 | Evictions: 0
+NVMe Misses: 2120 | NVMe->RAM: 7039.06 MB | RAM->VRAM: 12361.52 MB
+Hit Rate: VRAM=68.1% RAM=13.7% Total=81.8%
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 32 | Total Time: 6605.74 ms | Avg per Token: 206.43 ms (4.84 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       201.96 ms      6462.78 ms    97.8%
+ 2. router tensor readback (GPU->CPU)        2.37 ms        75.98 ms     1.2%
+ 3. Token logits & sampling                  0.80 ms        25.47 ms     0.4%
+ 4. Predictor & Prefetcher                   0.77 ms        24.50 ms     0.4%
+ 5. VRAM cache allocation & LRU              0.20 ms         6.42 ms     0.1%
+ 6. RAM -> VRAM PCIe promotion               0.11 ms         3.37 ms     0.1%
+ 7. LRU cache eviction                       0.08 ms         2.50 ms     0.0%
+ 8. Expert metadata lookup                   0.05 ms         1.72 ms     0.0%
+ 9. Atlas cache residency lookup             0.03 ms         1.11 ms     0.0%
+10. RAM cache lookup & management            0.02 ms         0.76 ms     0.0%
+11. NVMe read / staging to RAM               0.02 ms         0.75 ms     0.0%
+12. In-flight active expert pinning          0.01 ms         0.38 ms     0.0%
+13. CUDA / backend synchronization           0.00 ms         0.00 ms     0.0%
+-----------------------------------------------------------------
+
+=================================================================
+           ATLAS ENGINE V1 — QUALITY & SPEED CONTROLLER REPORT   
+=================================================================
+Target Quality Floor:  1.00 (Nominal K=10, Active K=4)
+Host Staging Pool:     512 MB pinned buffer (ACTIVE)
+Expert Cost Model:     DYNAMIC (GPU Hot Cache=0.05ms, Async H2D=0.42ms, CPU AVX2=3.30ms)
+Estimated Quality:     91.2%
+Repetition Score:      100.0%
+Entropy Score:         78.1%
+Quality Floor Status:  PASSED (Quality Floor Maintained)
+=================================================================
+
+
+--- STDERR ---
+0.01.929.393 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.14.321.465 I cmn          init: llama threadpool init, n_threads = 16

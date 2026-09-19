@@ -1,0 +1,176 @@
+[
+  [
+    {
+      "token_ids": [
+        19
+      ],
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 13202.0557,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-c2208c51",
+        "prompt_cache_bytes": 0,
+        "prompt_tokens": 36,
+        "text": "4<|im_end|>",
+        "ttft_ms": 12389.5695
+      }
+    },
+    {
+      "token_ids": [
+        19
+      ],
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 12793.2782,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-c8e0a8b0",
+        "prompt_cache_bytes": 0,
+        "prompt_tokens": 36,
+        "text": "4<|im_end|>",
+        "ttft_ms": 12030.186
+      }
+    },
+    {
+      "token_ids": [
+        21
+      ],
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 24512.2549,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-49705e82",
+        "prompt_cache_bytes": 0,
+        "prompt_tokens": 61,
+        "text": "6<|im_end|>",
+        "ttft_ms": 23386.8652
+      }
+    },
+    {
+      "token_ids": [
+        23
+      ],
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 15346.5119,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-e5ea0af0",
+        "prompt_cache_bytes": 0,
+        "prompt_tokens": 36,
+        "text": "8<|im_end|>",
+        "ttft_ms": 14623.7116
+      }
+    },
+    {
+      "token_ids": [
+        19
+      ],
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 11856.115,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-dd3ed779",
+        "prompt_cache_bytes": 0,
+        "prompt_tokens": 36,
+        "text": "4<|im_end|>",
+        "ttft_ms": 11074.6278
+      }
+    }
+  ],
+  [
+    {
+      "token_ids": [
+        19
+      ],
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 13634.2944,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-f5551458",
+        "prompt_cache_bytes": 238833048,
+        "prompt_tokens": 36,
+        "text": "4<|im_end|>",
+        "ttft_ms": 12560.0166
+      }
+    },
+    {
+      "token_ids": [
+        19
+      ],
+      "done": {
+        "cached_prompt_tokens": 36,
+        "completion_tokens": 2,
+        "elapsed_ms": 170.7542,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-d202acee",
+        "prompt_cache_bytes": 238833048,
+        "prompt_tokens": 36,
+        "text": "4<|im_end|>",
+        "ttft_ms": 29.8624
+      }
+    },
+    {
+      "token_ids": [
+        21
+      ],
+      "done": {
+        "cached_prompt_tokens": 16,
+        "completion_tokens": 2,
+        "elapsed_ms": 20175.6643,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-0261513f",
+        "prompt_cache_bytes": 240761928,
+        "prompt_tokens": 61,
+        "text": "6<|im_end|>",
+        "ttft_ms": 19378.9086
+      }
+    },
+    {
+      "token_ids": [
+        23
+      ],
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 12553.5505,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-a585cf5c",
+        "prompt_cache_bytes": 238833048,
+        "prompt_tokens": 36,
+        "text": "8<|im_end|>",
+        "ttft_ms": 11686.704
+      }
+    },
+    {
+      "token_ids": [
+        19
+      ],
+      "done": {
+        "cached_prompt_tokens": 16,
+        "completion_tokens": 2,
+        "elapsed_ms": 9167.4117,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-e2ba6463",
+        "prompt_cache_bytes": 238833048,
+        "prompt_tokens": 36,
+        "text": "4<|im_end|>",
+        "ttft_ms": 8196.7197
+      }
+    }
+  ]
+]

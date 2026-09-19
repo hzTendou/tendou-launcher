@@ -1,0 +1,94 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] MTP Speculative Engine ACTIVE: mode=ram quant=Q4_K_M loc=ram proposal_n=4 mtws=0
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=0 mtp=ram(Q4_K_M, loc=ram, n=4) fast_cb=0 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Newton's first law states that
+[RESPONSE]:  must not be serialized as plain text
+    special_tokens = {
+        "<|im_start|>": 100264,
+        "𐀀": 100264,  # U+10000 (non-BMP, above the CJK BMP range)
+        "𐿿": 100264,  # U+10FFF (non-BMP, above the CJK BMP range)
+    }
+
+    def count(text):
+        return len(enc.encode(text, allowed_special="all"))
+
+    result = render_messages(messages,
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  16805.5 ms
+[ATLAS] Prompt:   6 tokens / 3.434 s = 1.75 TPS
+[ATLAS] Generate: 128 tokens / 77.721 s = 1.65 TPS
+[ATLAS] Router events: 3324 decode / 49 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 2045.31 / 2048.00 MB | Hits: 41330 | Evictions: 79870
+RAM  Cache: 6142.58 / 6144.00 MB | Hits: 62240 | Evictions: 7646
+NVMe Misses: 18246 | NVMe->RAM: 60582.42 MB | RAM->VRAM: 267238.67 MB
+Hit Rate: VRAM=33.9% RAM=51.1% Total=85.0%
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 128 | Total Time: 71804.27 ms | Avg per Token: 560.97 ms (1.78 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       555.56 ms     71111.11 ms    99.0%
+ 2. VRAM cache allocation & LRU              1.64 ms       209.76 ms     0.3%
+ 3. RAM -> VRAM PCIe promotion               1.60 ms       204.21 ms     0.3%
+ 4. LRU cache eviction                       1.51 ms       193.61 ms     0.3%
+ 5. Predictor & Prefetcher                   0.26 ms        33.48 ms     0.0%
+ 6. Token logits & sampling                  0.10 ms        12.80 ms     0.0%
+ 7. Expert metadata lookup                   0.10 ms        12.76 ms     0.0%
+ 8. Atlas cache residency lookup             0.05 ms         6.36 ms     0.0%
+ 9. NVMe read / staging to RAM               0.05 ms         6.25 ms     0.0%
+10. RAM cache lookup & management            0.05 ms         5.80 ms     0.0%
+11. router tensor readback (GPU->CPU)        0.04 ms         4.72 ms     0.0%
+12. In-flight active expert pinning          0.03 ms         3.41 ms     0.0%
+13. CUDA / backend synchronization           0.00 ms         0.00 ms     0.0%
+-----------------------------------------------------------------
+
+=================================================================
+           ATLAS-AWARE MTP & MULTI-TOKEN WORKING SET (MTWS)        
+=================================================================
+MTP Mode:            ram (Q4_K_M, placed in ram)
+Draft Length N:      4
+Acceptance Rate:     66 / 180 (36.7%)
+Draft Latency:       3967.6 ms
+Verify Latency:      71791.5 ms
+Prefetch Latency:    0.0 ms
+
+--- ROUTE PREDICTION QUALITY (Sections 16 & 17) ---
+Future Candidates:   0 total, 0 unique
+Actual Unique Used:  0 unique
+Overlap (Intersect): 0
+Prediction Precision: 0.0%  (predicted experts actually used / predicted unique)
+Prediction Recall:    0.0%  (predicted experts actually used / actual unique)
+
+--- MULTI-TOKEN EXPERT REUSE (Section 14 & 16) ---
+Predicted Accesses:  0
+Actual Accesses:     119500
+Expert Reuses:       41157 within verification batches
+
+--- PREFETCH DEADLINE & WORKING SET TIERS (Sections 11 & 12) ---
+VRAM Working Set:    0.00 MB
+RAM Working Set:     0.00 MB
+NVMe Working Set:    0.00 MB
+Prefetch Completed Before Demand (Hits):   0
+Prefetch Late / Demanded In-Flight (Stalls): 0
+=================================================================
+
+
+--- STDERR ---
+0.03.439.300 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.17.224.358 I cmn          init: llama threadpool init, n_threads = 16
+0.17.225.019 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'

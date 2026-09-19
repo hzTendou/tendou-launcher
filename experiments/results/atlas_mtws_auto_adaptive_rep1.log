@@ -1,0 +1,98 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] MTP Speculative Engine ACTIVE: mode=atlas quant=Q4_K_M loc=vram proposal_n=3 mtws=1
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=1 mtp=atlas(Q4_K_M, loc=vram, n=3) fast_cb=0 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Newton's first law states that
+[RESPONSE]:  objects in motion stay in motion unless acted upon by an external force. But how does this apply to photons, and what happens when a photon encounters an object?
+
+<think>
+
+</think>
+
+Based on the principles of classical mechanics and quantum physics, here is a step-by-step deduction regarding how Newton's First Law applies to photons and what occurs during interactions.
+
+### 1. Analysis of Newton's First Law and Photons
+
+Newton's First Law (The Law of Inertia) states:
+> An object at rest remains at rest, and an object in motion remains in motion at a constant speed and in a straight line unless acted on
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  17291.4 ms
+[ATLAS] Prompt:   6 tokens / 3.273 s = 1.83 TPS
+[ATLAS] Generate: 128 tokens / 53.674 s = 2.38 TPS
+[ATLAS] Router events: 2589 decode / 49 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 3313.67 / 2048.00 MB | Hits: 30199 | Evictions: 59920
+RAM  Cache: 5966.60 / 6144.00 MB | Hits: 46897 | Evictions: 4859
+NVMe Misses: 14021 | NVMe->RAM: 46554.10 MB | RAM->VRAM: 202266.80 MB
+Hit Rate: VRAM=33.1% RAM=51.5% Total=84.6%
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 128 | Total Time: 51644.67 ms | Avg per Token: 403.47 ms (2.48 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       399.24 ms     51102.23 ms    98.9%
+ 2. VRAM cache allocation & LRU              1.27 ms       161.93 ms     0.3%
+ 3. RAM -> VRAM PCIe promotion               1.22 ms       156.10 ms     0.3%
+ 4. LRU cache eviction                       1.15 ms       147.60 ms     0.3%
+ 5. Predictor & Prefetcher                   0.16 ms        19.97 ms     0.0%
+ 6. router tensor readback (GPU->CPU)        0.14 ms        18.54 ms     0.0%
+ 7. Token logits & sampling                  0.10 ms        12.80 ms     0.0%
+ 8. Expert metadata lookup                   0.06 ms         8.30 ms     0.0%
+ 9. RAM cache lookup & management            0.05 ms         5.83 ms     0.0%
+10. Atlas cache residency lookup             0.04 ms         4.59 ms     0.0%
+11. NVMe read / staging to RAM               0.03 ms         4.28 ms     0.0%
+12. In-flight active expert pinning          0.02 ms         2.50 ms     0.0%
+13. CUDA / backend synchronization           0.00 ms         0.00 ms     0.0%
+-----------------------------------------------------------------
+
+=================================================================
+           ATLAS-AWARE MTP & MULTI-TOKEN WORKING SET (MTWS)        
+=================================================================
+MTP Mode:            atlas (Q4_K_M, placed in vram)
+Draft Length N:      3
+Acceptance Rate:     78 / 129 (60.5%)
+Draft Latency:       1795.4 ms
+Verify Latency:      51631.9 ms
+Prefetch Latency:    50.3 ms
+
+--- ROUTE PREDICTION QUALITY (Sections 16 & 17) ---
+Future Candidates:   60480 total, 21120 unique
+Actual Unique Used:  59453 unique
+Overlap (Intersect): 13099
+Prediction Precision: 62.0%  (predicted experts actually used / predicted unique)
+Prediction Recall:    22.0%  (predicted experts actually used / actual unique)
+
+--- MULTI-TOKEN EXPERT REUSE (Section 14 & 16) ---
+Predicted Accesses:  60480
+Actual Accesses:     87310
+Expert Reuses:       27827 within verification batches
+Expert Reuse Factor:  1.47x (expert loaded once -> reused by 1.47 tokens)
+
+--- PREFETCH DEADLINE & WORKING SET TIERS (Sections 11 & 12) ---
+VRAM Working Set:    415.04 MB
+RAM Working Set:     1178.71 MB
+NVMe Working Set:    0.00 MB
+Prefetch Completed Before Demand (Hits):   26198
+Prefetch Late / Demanded In-Flight (Stalls): 0
+=================================================================
+
+
+--- STDERR ---
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8150 MiB):
+  Device 0: NVIDIA GeForce RTX 5060 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+0.03.231.492 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.17.674.827 I cmn          init: llama threadpool init, n_threads = 16
+0.17.675.436 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'

@@ -1,0 +1,62 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=0 mtp=off(Q4_K_M, loc=ram, n=3) fast_cb=0 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Newton's first law states that
+[RESPONSE]:  an object in motion will continue moving at a constant velocity unless acted upon by an external force. Given this, why does a ball rolling on a horizontal surface eventually come to a stop?
+
+<think>
+
+</think>
+
+Based on Newton's First Law of Motion, the ball stops because the condition of "no external force" is not met in the real world.
+
+Here is the step-by-step logical deduction of why this occurs:
+
+### 1. Analysis of Newton's First Law
+Newton's First Law (the Law of Inertia) states that an object will maintain its state of rest or uniform motion in a straight line **unless acted
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  13904.5 ms
+[ATLAS] Prompt:   6 tokens / 3.981 s = 1.51 TPS
+[ATLAS] Generate: 128 tokens / 56.676 s = 2.26 TPS
+[ATLAS] Router events: 6144 decode / 48 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 2045.31 / 2048.00 MB | Hits: 21408 | Evictions: 99644
+RAM  Cache: 6142.58 / 6144.00 MB | Hits: 86465 | Evictions: 7076
+NVMe Misses: 13795 | NVMe->RAM: 45803.71 MB | RAM->VRAM: 332894.53 MB
+Hit Rate: VRAM=17.6% RAM=71.1% Total=88.7%
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 128 | Total Time: 56655.61 ms | Avg per Token: 442.62 ms (2.26 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       431.73 ms     55261.73 ms    97.5%
+ 2. Predictor & Prefetcher                   4.58 ms       586.18 ms     1.0%
+ 3. router tensor readback (GPU->CPU)        2.95 ms       377.22 ms     0.7%
+ 4. VRAM cache allocation & LRU              0.77 ms        98.33 ms     0.2%
+ 5. Token logits & sampling                  0.73 ms        93.39 ms     0.2%
+ 6. RAM -> VRAM PCIe promotion               0.72 ms        92.78 ms     0.2%
+ 7. LRU cache eviction                       0.61 ms        77.58 ms     0.1%
+ 8. RAM cache lookup & management            0.17 ms        21.98 ms     0.0%
+ 9. Expert metadata lookup                   0.11 ms        14.49 ms     0.0%
+10. CUDA / backend synchronization           0.10 ms        12.21 ms     0.0%
+11. Atlas cache residency lookup             0.07 ms         8.59 ms     0.0%
+12. NVMe read / staging to RAM               0.07 ms         8.32 ms     0.0%
+13. In-flight active expert pinning          0.02 ms         2.81 ms     0.0%
+-----------------------------------------------------------------
+
+--- STDERR ---
+0.02.073.654 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.14.309.234 I cmn          init: llama threadpool init, n_threads = 16

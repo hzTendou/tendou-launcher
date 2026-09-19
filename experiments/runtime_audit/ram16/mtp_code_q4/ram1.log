@@ -1,0 +1,42 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] Speculative Engine ACTIVE: types=none,draft-mtp draft_n=1 mtws=0 dft_ctx=yes
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=6600MB RAM=6144MB NVMe=BackingStore
+[ATLAS] product_gpu_mode: VRAM Max Capacity ACTIVE (Layers 0-1 MoE [1024 exps] + 48 Attn + 48 ShExp in GDDR6)
+[ATLAS] optimization_flags: mtws=0 mtp=ram(Q4_K_M, loc=ram, n=1) fast_cb=1 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: def fibonacci(n):
+[RESPONSE]: 
+    if n <= 1:
+        return n
+    else:
+        return fibonacci(n-1) + fibonacci(n-2)
+
+def main():
+    n = int(input("Digite a posição desejada: "))
+    print(fibonacci(n))
+
+main()<|endoftext|>
+[ATLAS_RESULT] {"accepted_tokens":26,"decode_span_ms":23496.2325,"draft_ms":737.5384000000003,"draft_tokens":34,"failed":false,"generated_tokens":60,"native_k":10,"prompt_tokens":4,"request_ms":25956.178,"token_ids":[198,262,413,307,2564,220,16,25,198,285,460,307,198,262,745,25,198,285,460,73111,1393,12,16,8,478,73111,1393,12,17,8,271,727,1822,4406,198,262,307,283,514,5216,437,43970,264,94808,184537,2499,25,77405,198,262,1133,925,564,38044,1393,578,271,3689,363,248044],"ttft_ms":2458.803,"verify_ms":23314.379999999997}
+
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  16115.4 ms
+[ATLAS] Prompt:   4 tokens / 1.664 s = 2.40 TPS
+[ATLAS] Generate: 60 tokens / 24.292 s = 2.47 TPS
+[ATLAS] Router events: 0 decode / 0 warmup
+Quality Floor Status:  NOT_EVALUATED (requires external task accuracy >= 85.0%)
+Active Router Width:   10
+=================================================================
+
+
+STDERR:
+[DEBUG-ATLAS] 1. Before common_init_from_params
+0.01.773.637 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+0.02.261.152 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.16.679.349 I cmn          init: llama threadpool init, n_threads = 14
+[DEBUG-ATLAS] 2. After common_init_from_params, res=000001D497362B50
+0.16.679.924 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'

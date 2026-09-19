@@ -1,0 +1,102 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] Adaptive-K Expert Pruning ACTIVE: K=6 (nominal=10, compute_reduction=40.0%)
+[ATLAS] MTP Speculative Engine ACTIVE: mode=atlas quant=Q4_K_M loc=vram proposal_n=2 mtws=1
+[ATLAS] ====================================================
+[ATLAS] runtime=v1-mtws model=qwen4exp A3B Q5_K - Small
+[ATLAS] memory_hierarchy: VRAM=2048MB RAM=6144MB NVMe=BackingStore
+[ATLAS] optimization_flags: mtws=1 mtp=atlas(Q4_K_M, loc=vram, n=2) fast_cb=0 page_prefetch=0
+[ATLAS] ====================================================
+
+[PROMPT]: Newton's first law states that
+[RESPONSE]:  an object in motion will remain in motion unless acted upon by an unbalanced force. What does this mean?
+
+<think>
+Okay, the user is asking about
+
+[ATLAS] ================= PERFORMANCE =================
+[ATLAS] Startup:  16215.1 ms
+[ATLAS] Prompt:   6 tokens / 2.219 s = 2.70 TPS
+[ATLAS] Generate: 32 tokens / 8.983 s = 3.56 TPS
+[ATLAS] Router events: 760 decode / 49 warmup
+
+=== ATLAS EXPERT MEMORY MANAGER SUMMARY ===
+VRAM Cache: 2045.31 / 2048.00 MB | Hits: 3874 | Evictions: 5489
+RAM  Cache: 6139.26 / 6144.00 MB | Hits: 2495 | Evictions: 288
+NVMe Misses: 3610 | NVMe->RAM: 11986.33 MB | RAM->VRAM: 20270.51 MB
+Hit Rate: VRAM=38.8% RAM=25.0% Total=63.8%
+===========================================
+
+=================================================================
+           ATLAS ENGINE V1 — HIGH-RESOLUTION BOTTLENECK REPORT     
+=================================================================
+Tokens Analyzed: 32 | Total Time: 8635.25 ms | Avg per Token: 269.85 ms (3.71 TPS)
+
+RANKED BOTTLENECKS (Section 40):
+-----------------------------------------------------------------
+ #  Component                           Avg (ms/tok)   Total (ms)     Share
+-----------------------------------------------------------------
+ 1. expert compute / graph execution       268.82 ms      8602.09 ms    99.6%
+ 2. router tensor readback (GPU->CPU)        0.32 ms        10.23 ms     0.1%
+ 3. VRAM cache allocation & LRU              0.20 ms         6.26 ms     0.1%
+ 4. RAM -> VRAM PCIe promotion               0.16 ms         5.05 ms     0.1%
+ 5. LRU cache eviction                       0.13 ms         4.11 ms     0.0%
+ 6. Token logits & sampling                  0.10 ms         3.20 ms     0.0%
+ 7. Expert metadata lookup                   0.03 ms         1.09 ms     0.0%
+ 8. NVMe read / staging to RAM               0.03 ms         0.92 ms     0.0%
+ 9. RAM cache lookup & management            0.03 ms         0.90 ms     0.0%
+10. Atlas cache residency lookup             0.02 ms         0.70 ms     0.0%
+11. In-flight active expert pinning          0.01 ms         0.42 ms     0.0%
+12. Predictor & Prefetcher                   0.01 ms         0.31 ms     0.0%
+13. CUDA / backend synchronization           0.00 ms         0.00 ms     0.0%
+-----------------------------------------------------------------
+
+=================================================================
+           ATLAS-AWARE MTP & MULTI-TOKEN WORKING SET (MTWS)        
+=================================================================
+MTP Mode:            atlas (Q4_K_M, placed in vram)
+Draft Length N:      2
+Acceptance Rate:     17 / 19 (89.5%)
+Draft Latency:       295.7 ms
+Verify Latency:      8632.1 ms
+Prefetch Latency:    3.4 ms
+
+--- ROUTE PREDICTION QUALITY (Sections 16 & 17) ---
+Future Candidates:   4896 total, 2880 unique
+Actual Unique Used:  7639 unique
+Overlap (Intersect): 1756
+Prediction Precision: 61.0%  (predicted experts actually used / predicted unique)
+Prediction Recall:    23.0%  (predicted experts actually used / actual unique)
+
+--- MULTI-TOKEN EXPERT REUSE (Section 14 & 16) ---
+Predicted Accesses:  4896
+Actual Accesses:     9942
+Expert Reuses:       2291 within verification batches
+Expert Reuse Factor:  1.30x (expert loaded once -> reused by 1.30 tokens)
+
+--- PREFETCH DEADLINE & WORKING SET TIERS (Sections 11 & 12) ---
+VRAM Working Set:    415.04 MB
+RAM Working Set:     541.21 MB
+NVMe Working Set:    0.00 MB
+Prefetch Completed Before Demand (Hits):   2918
+Prefetch Late / Demanded In-Flight (Stalls): 0
+=================================================================
+
+
+=================================================================
+           ATLAS ENGINE V1 — QUALITY & SPEED CONTROLLER REPORT   
+=================================================================
+Target Quality Floor:  0.90 (Nominal K=10, Active K=6)
+Estimated Quality:     92.1%
+Repetition Score:      100.0%
+Entropy Score:         80.2%
+Quality Floor Status:  PASSED (Quality Floor Maintained)
+=================================================================
+
+
+--- STDERR ---
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8150 MiB):
+  Device 0: NVIDIA GeForce RTX 5060 Laptop GPU, compute capability 12.0, VMM: yes, VRAM: 8150 MiB
+0.03.198.148 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.16.588.238 I cmn          init: llama threadpool init, n_threads = 16
+0.16.588.753 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'

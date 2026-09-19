@@ -1,0 +1,51 @@
+{
+  "general_task_quality": "NOT_EVALUATED",
+  "scope": "Fixed-input greedy token fidelity; no prompt checkpoint hits",
+  "exact_sequence_matches": 4,
+  "cases": 4,
+  "reference_tokens": 128,
+  "all_sequences_match": true,
+  "median_paired_speedup": {
+    "effective_speedup": 0.9521951053285509,
+    "decode_speedup": 0.9275921905715281,
+    "ttft_speedup": 1.076052400600981
+  },
+  "comparisons": [
+    {
+      "case": "code",
+      "repetition": 0,
+      "exact_tokens": true,
+      "reference_tokens": 32,
+      "effective_speedup": 1.1070236048533213,
+      "decode_speedup": 1.045927155345256,
+      "ttft_speedup": 1.1928547108708973
+    },
+    {
+      "case": "science",
+      "repetition": 0,
+      "exact_tokens": true,
+      "reference_tokens": 32,
+      "effective_speedup": 0.8427134845455223,
+      "decode_speedup": 0.9861359212895033,
+      "ttft_speedup": 0.7118424038095597
+    },
+    {
+      "case": "turkish",
+      "repetition": 0,
+      "exact_tokens": true,
+      "reference_tokens": 32,
+      "effective_speedup": 0.9739583338387161,
+      "decode_speedup": 0.869048459853553,
+      "ttft_speedup": 1.1314217098853945
+    },
+    {
+      "case": "reason",
+      "repetition": 0,
+      "exact_tokens": true,
+      "reference_tokens": 32,
+      "effective_speedup": 0.9304318768183858,
+      "decode_speedup": 0.8674118060412846,
+      "ttft_speedup": 1.0206830913165674
+    }
+  ]
+}

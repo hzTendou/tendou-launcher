@@ -1,0 +1,12 @@
+[ATLAS] Loaded physical map with 24576 experts from: config/atlas_physical_map_qwen38.json
+[ATLAS] PagePrefetcher: DISABLED (residency-only mode)
+[ATLAS] Speculative Engine ACTIVE: types=none,draft-mtp draft_n=1 mtws=0 dft_ctx=yes
+
+STDERR:
+[DEBUG-ATLAS] 1. Before common_init_from_params
+0.01.703.502 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+0.02.186.245 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.18.514.733 I cmn          init: llama threadpool init, n_threads = 14
+[DEBUG-ATLAS] 2. After common_init_from_params, res=000001BA04DDDBA0
+0.18.515.287 I common_speculative_init_result: creating MTP draft context against the target model 'C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf'
+C:\Users\Ali\WebProjects\atlas-engine-v1\llama.cpp\src\llama-batch.cpp:609: GGML_ASSERT(n_ubatch > n_keep_tail) failed

@@ -1,0 +1,182 @@
+{
+  "exe": "C:\\Users\\Ali\\WebProjects\\atlas-engine-v1\\llama.cpp\\build\\bin\\Release\\llama-atlas-engine.exe",
+  "exe_sha256": "c1d6b154bd18b717a0148ef43badad828356f3019033b3f33a1c9061b3adb86a",
+  "native_router": true,
+  "engine_args": [],
+  "context": 2048,
+  "max_tokens": 16,
+  "temperature": 0,
+  "startup_s": 24.446106699999746,
+  "results": [
+    {
+      "case": "math",
+      "prompt": "<|im_start|>user\nWhat is 17 times 19? Answer with just the number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "repetition": 0,
+      "ttft_ms": 11947.750100000121,
+      "elapsed_s": 14.920524999999998,
+      "effective_tps": 0.2010653110396585,
+      "decode_tps": 0.9708322197079303,
+      "token_ids": [
+        18,
+        17,
+        18
+      ],
+      "text": "323",
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 4,
+        "elapsed_ms": 14906.0408,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-7e3ad911",
+        "prompt_cache_bytes": 119980844,
+        "prompt_tokens": 28,
+        "text": "323<|im_end|>",
+        "ttft_ms": 11934.3998
+      }
+    },
+    {
+      "case": "math",
+      "prompt": "<|im_start|>user\nWhat is 17 times 19? Answer with just the number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "repetition": 1,
+      "ttft_ms": 111.22019999993427,
+      "elapsed_s": 2.3653073999998924,
+      "effective_tps": 1.2683340863010604,
+      "decode_tps": 1.3370509589563744,
+      "token_ids": [
+        18,
+        17,
+        18
+      ],
+      "text": "323",
+      "done": {
+        "cached_prompt_tokens": 28,
+        "completion_tokens": 4,
+        "elapsed_ms": 2363.2605,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-db740fd5",
+        "prompt_cache_bytes": 119980844,
+        "prompt_tokens": 28,
+        "text": "323<|im_end|>",
+        "ttft_ms": 109.2399
+      }
+    },
+    {
+      "case": "code",
+      "prompt": "<|im_start|>user\nWhat does Python sorted([3, 1, 2]) return? Reply with only the list.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "repetition": 0,
+      "ttft_ms": 16115.21330000005,
+      "elapsed_s": 26.93606890000001,
+      "effective_tps": 0.33412447946329676,
+      "decode_tps": 0.8052490967621754,
+      "token_ids": [
+        58,
+        16,
+        11,
+        220,
+        17,
+        11,
+        220,
+        18,
+        60
+      ],
+      "text": "[1, 2, 3]",
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 10,
+        "elapsed_ms": 26931.9469,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-a2a83bc1",
+        "prompt_cache_bytes": 120150044,
+        "prompt_tokens": 33,
+        "text": "[1, 2, 3]<|im_end|>",
+        "ttft_ms": 16095.9087
+      }
+    },
+    {
+      "case": "code",
+      "prompt": "<|im_start|>user\nWhat does Python sorted([3, 1, 2]) return? Reply with only the list.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "repetition": 1,
+      "ttft_ms": 230.42850000001636,
+      "elapsed_s": 9.490406500000063,
+      "effective_tps": 0.9483260806583933,
+      "decode_tps": 0.963480917814795,
+      "token_ids": [
+        58,
+        16,
+        11,
+        220,
+        17,
+        11,
+        220,
+        18,
+        60
+      ],
+      "text": "[1, 2, 3]",
+      "done": {
+        "cached_prompt_tokens": 33,
+        "completion_tokens": 10,
+        "elapsed_ms": 9483.1965,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-d27b31db",
+        "prompt_cache_bytes": 120150044,
+        "prompt_tokens": 33,
+        "text": "[1, 2, 3]<|im_end|>",
+        "ttft_ms": 226.284
+      }
+    },
+    {
+      "case": "logic",
+      "prompt": "<|im_start|>user\nAll ravens are birds. All birds are animals. Are all ravens animals? Answer yes or no.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "repetition": 0,
+      "ttft_ms": 18841.517600000316,
+      "elapsed_s": 20.26192949999995,
+      "effective_tps": 0.04935364127093633,
+      "decode_tps": null,
+      "token_ids": [
+        9175
+      ],
+      "text": "Yes",
+      "done": {
+        "cached_prompt_tokens": 0,
+        "completion_tokens": 2,
+        "elapsed_ms": 20258.4107,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-88b1489c",
+        "prompt_cache_bytes": 120183884,
+        "prompt_tokens": 34,
+        "text": "Yes<|im_end|>",
+        "ttft_ms": 18837.878
+      }
+    },
+    {
+      "case": "logic",
+      "prompt": "<|im_start|>user\nAll ravens are birds. All birds are animals. Are all ravens animals? Answer yes or no.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "repetition": 1,
+      "ttft_ms": 107.29330000003756,
+      "elapsed_s": 0.38745760000028895,
+      "effective_tps": 2.580927564717415,
+      "decode_tps": null,
+      "token_ids": [
+        9175
+      ],
+      "text": "Yes",
+      "done": {
+        "cached_prompt_tokens": 34,
+        "completion_tokens": 2,
+        "elapsed_ms": 384.6739,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-0fd41d90",
+        "prompt_cache_bytes": 120183884,
+        "prompt_tokens": 34,
+        "text": "Yes<|im_end|>",
+        "ttft_ms": 104.9672
+      }
+    }
+  ]
+}

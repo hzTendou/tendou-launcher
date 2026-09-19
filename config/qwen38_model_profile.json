@@ -1,0 +1,22 @@
+{
+  "architecture": "qwen4exp",
+  "name": "Qwen3.8 Flash Next Abliterated",
+  "quantization": "Q5_K_S",
+  "block_count": 48,
+  "expert_count": 512,
+  "expert_used_count": 10,
+  "context_length": 262144,
+  "embedding_length": 2560,
+  "attention_head_count": 24,
+  "attention_head_count_kv": 2,
+  "full_attention_interval": 4,
+  "ssm_inner_size": 6144,
+  "expert_feed_forward_length": 640,
+  "expert_shared_feed_forward_length": 640,
+  "source": "Metadata.txt bundled by user",
+  "model_format": "GGUF multi-part",
+  "shard_count": 3,
+  "model_path": "C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\\snapshots\\06756566a4b4a29d0dee62ccb405914a15fdf80d\\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf",
+  "model_shard_pattern": "Qwen3.8-Flash-Next-Uncensored-Q5_K_S-0000{index}-of-00003.gguf",
+  "storage": "huggingface_cache"
+}
