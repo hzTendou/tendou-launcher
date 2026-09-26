@@ -30,8 +30,8 @@ logger = logging.getLogger("atlas.server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 DEFAULT_MODEL_ID = "qwen3.8-flash-next"
-DEFAULT_MODEL_PATH = r"C:\Users\Ali\.cache\huggingface\hub\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\snapshots\06756566a4b4a29d0dee62ccb405914a15fdf80d\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf"
-DEFAULT_EXE_PATH = os.path.join(
+DEFAULT_MODEL_PATH = os.environ.get("TENDOU_MODEL_PATH", "")
+DEFAULT_EXE_PATH = os.environ.get("TENDOU_ENGINE_PATH") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "llama.cpp", "build", "bin", "Release", "llama-atlas-engine.exe"
 )
@@ -82,7 +82,7 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
         self,
         exe_path: str = DEFAULT_EXE_PATH,
         model_path: str = DEFAULT_MODEL_PATH,
-        threads: int = 8,
+        threads: int = 16,
         boost: bool = True,
         gpu: bool = True,
         gpu_layers: int = 2,
@@ -102,9 +102,13 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
         p3_async_transfer: bool = False,
         p3_staging_slots: int = 4,
         p3_queue_depth: int = 8,
-        prompt_cache_mb: int = 1024,
+        prompt_cache_mb: int = 256,
+        cuda_sched: Optional[str] = "yield",
         cache_type_k: Optional[str] = None,
         cache_type_v: Optional[str] = None,
+        mtp: Optional[str] = None,
+        mtp_draft_n: int = 2,
+        mtp_path: Optional[str] = None,
         extra_args: Optional[List[str]] = None,
     ):
         self.exe_path = exe_path
@@ -130,8 +134,12 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
         self.p3_staging_slots = p3_staging_slots
         self.p3_queue_depth = p3_queue_depth
         self.prompt_cache_mb = prompt_cache_mb
+        self.cuda_sched = cuda_sched
         self.cache_type_k = cache_type_k
         self.cache_type_v = cache_type_v
+        self.mtp = mtp
+        self.mtp_draft_n = mtp_draft_n
+        self.mtp_path = mtp_path
         self.extra_args = extra_args or []
 
         self.proc: Optional[asyncio.subprocess.Process] = None
@@ -142,6 +150,7 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
         self._stderr_task: Optional[asyncio.Task] = None
         self._is_ready = False
         self._start_time = 0.0
+        self.stderr_lines: List[str] = []
 
     async def start(self) -> None:
         self.ready_event.clear()
@@ -205,12 +214,26 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
             ])
         if self.prompt_cache_mb > 0 and not any(arg == "--atlas-prompt-cache-mb" for arg in self.extra_args):
             cmd.extend(["--atlas-prompt-cache-mb", str(self.prompt_cache_mb)])
+        if self.cuda_sched and not any(arg == "--atlas-cuda-sched" for arg in self.extra_args):
+            cmd.extend(["--atlas-cuda-sched", str(self.cuda_sched)])
+        if self.mtp and self.mtp != "off":
+            if not any(arg == "--atlas-mtp" for arg in self.extra_args):
+                cmd.extend(["--atlas-mtp", str(self.mtp)])
+            if not any(arg in ("--atlas-mtp-draft-n", "--atlas-mtp-n") for arg in self.extra_args):
+                cmd.extend(["--atlas-mtp-draft-n", str(self.mtp_draft_n)])
+            if self.mtp_path and not any(arg == "--atlas-mtp-path" for arg in self.extra_args):
+                cmd.extend(["--atlas-mtp-path", str(self.mtp_path)])
         cmd.extend(self.extra_args)
 
         logger.info(f"Launching tendou launcher: {' '.join(cmd)}")
         self._start_time = time.time()
 
         env = os.environ.copy()
+        env["GGML_CUDA_REGISTER_HOST"] = os.environ.get("GGML_CUDA_REGISTER_HOST", "1")
+        if self.cuda_sched:
+            env["ATLAS_CUDA_SCHED"] = os.environ.get("ATLAS_CUDA_SCHED", str(self.cuda_sched))
+        if self.mtp != "off":
+            env["ATLAS_MTP_UNION_CAP"] = os.environ.get("ATLAS_MTP_UNION_CAP", "6")
         cuda_bin = os.path.join(sysconfig.get_path("purelib"), "nvidia", "cu13", "bin", "x86_64")
         if os.name == "nt" and os.path.isdir(cuda_bin):
             env["PATH"] = cuda_bin + os.pathsep + env.get("PATH", "")
@@ -226,13 +249,14 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
         self._reader_task = asyncio.create_task(self._stdout_reader())
         self._stderr_task = asyncio.create_task(self._stderr_reader())
 
-        # Wait up to 120s for [ATLAS_READY]
+        # Wait up to 300s for [ATLAS_READY] (large multi-shard GGUF cold mmap safety)
         try:
-            await asyncio.wait_for(self.ready_event.wait(), timeout=120.0)
+            await asyncio.wait_for(self.ready_event.wait(), timeout=300.0)
             if self.proc.returncode is not None:
                 code = self.proc.returncode
+                stderr_dump = "\n".join(self.stderr_lines[-30:])
                 await self.stop()
-                raise RuntimeError(f"tendou launcher exited during startup (code {code}). Check runtime DLLs and stderr.")
+                raise RuntimeError(f"tendou launcher exited during startup (code {code}):\n{stderr_dump}")
             self._is_ready = True
             logger.info("tendou launcher is READY for inference.")
         except asyncio.TimeoutError:
@@ -280,6 +304,7 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
                 break
             line = line_bytes.decode("utf-8", errors="replace").strip()
             if line:
+                self.stderr_lines.append(line)
                 logger.debug(f"[Engine Stderr] {line}")
 
     async def stop(self) -> None:
@@ -288,11 +313,12 @@ class AtlasSubprocessBackend(BaseAtlasBackend):
             try:
                 if self.proc.stdin:
                     self.proc.stdin.write(b'{"cmd":"exit"}\n')
+                    await self.proc.stdin.drain()
             except Exception:
                 pass
 
             try:
-                await asyncio.wait_for(self.proc.wait(), timeout=1.0)
+                await asyncio.wait_for(self.proc.wait(), timeout=3.0)
             except (asyncio.TimeoutError, Exception):
                 try:
                     if os.name == "nt":
@@ -1124,6 +1150,17 @@ def create_app(
                         finish_reason = event.get("finish_reason", "stop")
                         prompt_tokens = event.get("prompt_tokens", len(prompt.split()))
                         completion_tokens = event.get("completion_tokens", len(full_text.split()))
+                        # Log MTP speculative metrics when available
+                        spec_drafted = event.get("spec_draft_tokens", 0)
+                        if spec_drafted:
+                            acc = event.get("spec_acceptance_rate", 0.0)
+                            eff_tps = event.get("spec_effective_tps", 0.0)
+                            import sys
+                            print(
+                                f"[MTP] draft={spec_drafted} accepted={event.get('spec_accepted_tokens',0)}"
+                                f" acc={acc:.2%} eff_tps={eff_tps:.1f}",
+                                file=sys.stderr, flush=True
+                            )
 
                 # Parse tool calls and reasoning content
                 cleaned_content, tool_calls, reasoning_content = parse_tool_calls_from_text(full_text)
@@ -1620,15 +1657,16 @@ def kill_process_on_port(port: int) -> bool:
 # CLI Entry Point & Runner
 # ---------------------------------------------------------------------------
 
-def main():
+def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="tendou launcher OpenAI-Compatible Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host address to bind (default: 0.0.0.0)")
+    parser.add_argument("--host", default="127.0.0.1", help="Host address to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
     parser.add_argument("--force", action="store_true", help="Force terminate any existing process occupying the target port")
     parser.add_argument("--exe-path", default=DEFAULT_EXE_PATH, help="Path to llama-atlas-engine.exe")
-    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Path to model GGUF")
-    parser.add_argument("--threads", "-t", type=int, default=8, help="Number of CPU threads (default: 8)")
-    parser.add_argument("--prompt-cache-mb", type=int, default=1024, help="Prompt cache memory budget in MB (default: 1024)")
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH,
+                        help="Path to model GGUF (or set TENDOU_MODEL_PATH)")
+    parser.add_argument("--threads", "-t", type=int, default=16, help="Number of CPU threads (default: 16)")
+    parser.add_argument("--prompt-cache-mb", type=int, default=256, help="Prompt cache memory budget in MB (default: 256)")
     parser.add_argument("--boost", action="store_true", default=True, help="Enable Atlas boost mode (default: True)")
     parser.add_argument("--gpu", dest="gpu", action="store_true", default=True, help="Enable GPU-first acceleration with full VRAM capacity (default: True)")
     parser.add_argument("--cpu-only", dest="gpu", action="store_false", help="Run CPU-only fallback engine (for systems without GPUs)")
@@ -1661,8 +1699,20 @@ def main():
                         help="P3 pinned staging buffer slots (default: 4)")
     parser.add_argument("--p3-queue-depth", type=int, default=8,
                         help="P3 H2D queue depth (default: 8)")
+    parser.add_argument("--cuda-sched", default="yield", choices=["yield", "blocking", "spin", "auto"],
+                        help="CUDA primary context scheduling mode (default: yield)")
+    parser.add_argument("--mtp", choices=["off", "ram", "vram", "atlas", "auto"], default=None,
+                        help="Enable MTP speculative decoding mode (off, ram, vram, atlas, auto)")
+    parser.add_argument("--mtp-draft-n", type=int, default=2,
+                        help="MTP speculative draft token count (default: 2)")
+    parser.add_argument("--mtp-path", type=str, default=None,
+                        help="Optional separate MTP draft model GGUF path")
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv=None):
+    parser = create_parser()
+    args = parser.parse_args(argv)
 
     if args.aggressive_prefetch:
         args.odmoe_lead = 4
@@ -1731,6 +1781,10 @@ def main():
             p3_staging_slots=args.p3_staging_slots,
             p3_queue_depth=args.p3_queue_depth,
             prompt_cache_mb=args.prompt_cache_mb,
+            cuda_sched=args.cuda_sched,
+            mtp=args.mtp,
+            mtp_draft_n=args.mtp_draft_n,
+            mtp_path=args.mtp_path,
         )
 
     app = create_app(backend=backend, host=args.host, port=args.port)

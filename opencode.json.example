@@ -3,17 +3,17 @@
   "provider": {
     "atlas": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Atlas Engine Local",
+      "name": "tendou launcher Local",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
         "apiKey": "opencode-local-key"
       },
       "models": {
         "qwen3.8-flash-next": {
-          "name": "Qwen 3.8 Flash Next (Atlas V1)"
+          "name": "Qwen 3.8 Flash Next (tendou launcher)"
         },
         "atlas-engine": {
-          "name": "Atlas Engine V1"
+          "name": "tendou launcher"
         }
       }
     }

@@ -136,7 +136,7 @@ struct Config {
     double target_acceptance  = 0.35;
 
     // Multi-Threading & Compute Co-Design (FreeToken Physical Core Policy)
-    int n_threads             = 8;     // Optimal 8 physical threads for AMD Ryzen 7 260 (eliminates SMT contention)
+    int n_threads             = 16;    // Optimal 16 SMT threads for AMD Ryzen 7 260 (CPU-GPU latency hiding)
     float mtp_p_min           = 0.28f; // Minimum confidence: only verify draft tokens with p >= p_min
     int hotness_bonus         = 2;     // Eviction resistance passes for hot experts
 
@@ -154,6 +154,8 @@ struct Config {
     int grouped_gemm          = 2;     // 1, 2, or 3 concurrent Grouped-GEMMs
     int cuda_streams          = 2;     // 1, 2, or 3 concurrent CUDA streams
     bool async_h2d            = true;  // Asynchronous H2D PCIe transfer overlap
+    std::string cuda_sched    = "yield"; // Primary context scheduling: "yield", "blocking", "spin", "auto"
+
 
     // Dynamic Confidence-Based K Routing & Adaptive Pruning
     float dynamic_k_thresh    = 0.0f;  // 0.0 = disabled (static K), > 0.0 = threshold (e.g. 0.65, 0.82)
@@ -182,7 +184,7 @@ struct Config {
     // IPC Mode for OpenAI Server Integration
     bool  ipc_mode            = false; // When true, runs persistent IPC loop for OpenAI API
     bool  simulate_placement  = false; // Cost-model diagnostics, not CUDA execution.
-    size_t prompt_cache_mb   = 1024;  // Shared budget for full-prompt and chat-boundary checkpoints.
+    size_t prompt_cache_mb   = 256;   // Shared budget for full-prompt and chat-boundary checkpoints.
 
     // OD-MoE: Predictive Multi-Layer Expert Prefetch & Quick Eviction
     bool  enable_odmoe        = true;  // Multi-layer advance prefetching
@@ -1001,6 +1003,10 @@ struct Metrics {
     uint64_t spec_accepted_tokens = 0;
     double spec_draft_time_ms = 0.0;
     double spec_verify_time_ms = 0.0;
+    // Derived: recomputed by print_metrics() / CLI summary
+    double spec_acceptance_rate() const {
+        return spec_draft_tokens > 0 ? double(spec_accepted_tokens) / double(spec_draft_tokens) : 0.0;
+    }
 
     // Atlas MTWS (Multi-Token Working Set) Metrics (Sections 15, 16, 17)
     uint64_t mtws_plans_generated = 0;

@@ -1,13 +1,81 @@
-data/traces/*.jsonl
-data/reports/*.json
-data/reports/*.csv
-__pycache__/
-.venv*/
-.pytest_cache/
-checkpoints/*/bin/
-
-# Local agent memory and development planning
+# Local agent state and private planning
+.context/
 AGENT.md
 AGENTS.md
 docs/NEXT_STEPS.md
 docs/agent-history.md
+
+# Local dependency checkouts
+llama.cpp/
+
+# Python environments and caches
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local client and machine-specific runtime configuration
+opencode.json
+config/runtime_default.json
+config/atlas_map_*.json
+config/atlas_physical_map*.json
+config/qwen38_audit_report.json
+config/qwen38_model_profile.json
+config/trace_*.jsonl
+
+# Models, checkpoints, and generated experiment data
+*.gguf
+*.safetensors
+*.bin
+checkpoints/
+data/traces/
+data/reports/
+experiments/*
+!experiments/__init__.py
+!experiments/legacy/
+!experiments/legacy/**
+experiments/legacy/**/__pycache__/
+experiments/legacy/**/*.py[cod]
+
+# Local audit/history material
+docs/BENCHMARK_LOG.md
+docs/RUNTIME_AUDIT_*.md
+docs/history/
+
+# Machine-specific and one-off development helpers
+fix.py
+scripts/apply_engine_cpp.py
+scripts/update_engine.py
+scripts/inspect_model_full.py
+scripts/run_benchmarks.py
+scripts/run_gpu_first_benchmark.py
+scripts/run_grouped_gemm_benchmark.py
+scripts/run_speed_matrix.py
+scripts/benchmark_mtp.py
+scripts/benchmark_native_api.py
+scripts/build_cpu_kernel.cmd
+scripts/build_mtp_common.cmd
+scripts/build_mtp_graph.cmd
+scripts/build_native_http.cmd
+tests/unit/test_atlas_qwen38.py
+
+# Native build products and runtime logs
+build/
+*.dll
+*.exe
+*.lib
+*.obj
+*.pdb
+*.rsp
+*.log
+engine_out.log
+engine_err.log
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

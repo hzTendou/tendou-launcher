@@ -16,6 +16,9 @@ int main() {
     CHECK(cfg.spice_conf_mid == 0.30);
     CHECK(!cfg.enable_tutti);
     CHECK(cfg.tutti_queue_depth == 64);
+    CHECK(cfg.cuda_sched == "yield");
+    CHECK(cfg.n_threads == 16);
+    CHECK(cfg.prompt_cache_mb == 256);
     cfg.enable_tutti = true;
     cfg.tutti_queue_depth = 4;
     const std::string path = "experiments/runtime_audit/2026-09-10/prefetch-test.bin";
@@ -252,5 +255,16 @@ int main() {
     CHECK(safe_buf.is_resident(0, 1));
 
     ggml_backend_buffer_free(buffer); ggml_free(ctx);
-    std::puts("PASS: native async hints, failure, bounds, cancellation, confidence, router boundaries, P2 GPU binding, P3 async transfer");
+
+    // Verify CUDA primary context scheduling configuration helper
+    CHECK(atlas_configure_cuda_primary_ctx("yield"));
+    CHECK(atlas_configure_cuda_primary_ctx("blocking"));
+    CHECK(atlas_configure_cuda_primary_ctx("spin"));
+    CHECK(atlas_configure_cuda_primary_ctx("auto"));
+    CHECK(atlas_configure_cuda_primary_ctx("  yield  "));
+    CHECK(!atlas_configure_cuda_primary_ctx(""));
+    CHECK(!atlas_configure_cuda_primary_ctx("   "));
+    CHECK(!atlas_configure_cuda_primary_ctx("invalid_sched_mode"));
+
+    std::puts("PASS: native async hints, failure, bounds, cancellation, confidence, router boundaries, P2 GPU binding, P3 async transfer, CUDA primary ctx scheduling");
 }

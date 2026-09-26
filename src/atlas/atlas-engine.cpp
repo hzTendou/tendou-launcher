@@ -225,14 +225,16 @@ private:
     MmapEntry blobs_[3];
 
     void init_mappings() {
-        static const char * BLOB_PATHS[3] = {
-            "C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\\blobs\\98c001112ee9d661fa21b7c2162e24dbfabb6a08af14e4cabfaa73c351ce365b",
-            "C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\\blobs\\d43111ec60a5868cdb60bdcffed89454ac8d51b911d5a847f7d2c2f6f20c6b7a",
-            "C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\\blobs\\1cf59e7ae710a43b5dfc3fe03f16fa74ae752f18ea1c555dc87a1c2678401366"
+        static const char * BLOB_ENV_VARS[3] = {
+            "TENDOU_MODEL_BLOB_1",
+            "TENDOU_MODEL_BLOB_2",
+            "TENDOU_MODEL_BLOB_3",
         };
         for (int i = 0; i < 3; ++i) {
+            const char * blob_path = std::getenv(BLOB_ENV_VARS[i]);
+            if (!blob_path || !blob_path[0]) continue;
 #if defined(_WIN32)
-            blobs_[i].hFile = CreateFileA(BLOB_PATHS[i], GENERIC_READ, FILE_SHARE_READ, nullptr,
+            blobs_[i].hFile = CreateFileA(blob_path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                                           OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
             if (blobs_[i].hFile != INVALID_HANDLE_VALUE) {
                 LARGE_INTEGER sz{};
@@ -245,7 +247,7 @@ private:
                 }
             }
 #else
-            int fd = open(BLOB_PATHS[i], O_RDONLY);
+            int fd = open(blob_path, O_RDONLY);
             if (fd >= 0) {
                 struct stat st;
                 if (fstat(fd, &st) == 0) {
@@ -1711,7 +1713,7 @@ void Runtime::print_mtws_report() const {
     std::printf("MTP Mode:            %s (%s, placed in %s)\n",
         m.mtp_mode.c_str(), m.mtp_quant.c_str(), m.mtp_location.c_str());
     std::printf("Draft Length N:      %d\n", m.mtp_draft_n);
-    double acc_rate = (100.0 * m.spec_accepted_tokens) / std::max<uint64_t>(m.spec_draft_tokens, 1);
+    double acc_rate = m.spec_acceptance_rate() * 100.0;
     std::printf("Acceptance Rate:     %" PRIu64 " / %" PRIu64 " (%.1f%%)\n",
         m.spec_accepted_tokens, m.spec_draft_tokens, acc_rate);
     std::printf("Draft Latency:       %.1f ms\n", m.spec_draft_time_ms);
@@ -2336,6 +2338,97 @@ static bool atlas_eval_callback(struct ggml_tensor * t, bool ask, void * user_da
     return true;
 }
 
+inline bool atlas_configure_cuda_primary_ctx(const std::string & mode_raw) {
+    std::string mode = mode_raw;
+    while (!mode.empty() && (mode.front() == ' ' || mode.front() == '\t' || mode.front() == '\r' || mode.front() == '\n')) {
+        mode.erase(mode.begin());
+    }
+    while (!mode.empty() && (mode.back() == ' ' || mode.back() == '\t' || mode.back() == '\r' || mode.back() == '\n')) {
+        mode.pop_back();
+    }
+    if (mode.empty()) {
+        return false;
+    }
+    unsigned int flags = 0;
+    if (mode == "yield") {
+        flags = 0x02; // CU_CTX_SCHED_YIELD
+    } else if (mode == "blocking") {
+        flags = 0x04; // CU_CTX_SCHED_BLOCKING_SYNC
+    } else if (mode == "spin") {
+        flags = 0x01; // CU_CTX_SCHED_SPIN
+    } else if (mode == "auto") {
+        flags = 0x00; // CU_CTX_SCHED_AUTO
+    } else {
+        return false;
+    }
+
+#if defined(_WIN32)
+    HMODULE hCuda = LoadLibraryA("nvcuda.dll");
+    if (!hCuda) {
+        return true;
+    }
+    typedef int (__stdcall * PFN_cuInit)(unsigned int);
+    typedef int (__stdcall * PFN_cuDeviceGetCount)(int *);
+    typedef int (__stdcall * PFN_cuDevicePrimaryCtxGetState)(int, unsigned int *, int *);
+    typedef int (__stdcall * PFN_cuDevicePrimaryCtxSetFlags_v2)(int, unsigned int);
+
+    PFN_cuInit pfn_cuInit = (PFN_cuInit) GetProcAddress(hCuda, "cuInit");
+    PFN_cuDeviceGetCount pfn_cuDeviceGetCount = (PFN_cuDeviceGetCount) GetProcAddress(hCuda, "cuDeviceGetCount");
+    PFN_cuDevicePrimaryCtxGetState pfn_cuGetState = (PFN_cuDevicePrimaryCtxGetState) GetProcAddress(hCuda, "cuDevicePrimaryCtxGetState");
+    PFN_cuDevicePrimaryCtxSetFlags_v2 pfn_cuSetFlags = (PFN_cuDevicePrimaryCtxSetFlags_v2) GetProcAddress(hCuda, "cuDevicePrimaryCtxSetFlags_v2");
+
+    if (pfn_cuInit && pfn_cuDeviceGetCount && pfn_cuGetState && pfn_cuSetFlags) {
+        if (pfn_cuInit(0) == 0) {
+            int dev_count = 0;
+            if (pfn_cuDeviceGetCount(&dev_count) == 0 && dev_count > 0) {
+                for (int dev = 0; dev < dev_count; ++dev) {
+                    unsigned int cur_flags = 0;
+                    int active = 0;
+                    if (pfn_cuGetState(dev, &cur_flags, &active) == 0 && !active) {
+                        pfn_cuSetFlags(dev, flags);
+                    }
+                }
+            }
+        }
+    }
+    FreeLibrary(hCuda);
+#elif defined(__linux__)
+    void * hCuda = dlopen("libcuda.so.1", RTLD_NOW);
+    if (!hCuda) {
+        hCuda = dlopen("libcuda.so", RTLD_NOW);
+    }
+    if (!hCuda) {
+        return true;
+    }
+    typedef int (* PFN_cuInit)(unsigned int);
+    typedef int (* PFN_cuDeviceGetCount)(int *);
+    typedef int (* PFN_cuDevicePrimaryCtxGetState)(int, unsigned int *, int *);
+    typedef int (* PFN_cuDevicePrimaryCtxSetFlags_v2)(int, unsigned int);
+
+    PFN_cuInit pfn_cuInit = (PFN_cuInit) dlsym(hCuda, "cuInit");
+    PFN_cuDeviceGetCount pfn_cuDeviceGetCount = (PFN_cuDeviceGetCount) dlsym(hCuda, "cuDeviceGetCount");
+    PFN_cuDevicePrimaryCtxGetState pfn_cuGetState = (PFN_cuDevicePrimaryCtxGetState) dlsym(hCuda, "cuDevicePrimaryCtxGetState");
+    PFN_cuDevicePrimaryCtxSetFlags_v2 pfn_cuSetFlags = (PFN_cuDevicePrimaryCtxSetFlags_v2) dlsym(hCuda, "cuDevicePrimaryCtxSetFlags_v2");
+
+    if (pfn_cuInit && pfn_cuDeviceGetCount && pfn_cuGetState && pfn_cuSetFlags) {
+        if (pfn_cuInit(0) == 0) {
+            int dev_count = 0;
+            if (pfn_cuDeviceGetCount(&dev_count) == 0 && dev_count > 0) {
+                for (int dev = 0; dev < dev_count; ++dev) {
+                    unsigned int cur_flags = 0;
+                    int active = 0;
+                    if (pfn_cuGetState(dev, &cur_flags, &active) == 0 && !active) {
+                        pfn_cuSetFlags(dev, flags);
+                    }
+                }
+            }
+        }
+    }
+    dlclose(hCuda);
+#endif
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2389,7 +2482,7 @@ int main(int argc, char ** argv) {
             }
         } else if (arg == "--atlas-verify-batch") {
             cfg.verify_batch = true;
-        } else if (arg == "--atlas-mtp-draft-n" && i + 1 < argc) {
+        } else if ((arg == "--atlas-mtp-draft-n" || arg == "--atlas-mtp-n") && i + 1 < argc) {
             cfg.mtp_draft_n = std::stoi(argv[++i]);
         } else if (arg == "--atlas-mtp-path" && i + 1 < argc) {
             cfg.mtp_path = argv[++i];
@@ -2418,6 +2511,8 @@ int main(int argc, char ** argv) {
             const int mb = std::stoi(argv[++i]);
             if (mb < 0 || mb > 4096) return 1;
             cfg.prompt_cache_mb = size_t(mb);
+        } else if (arg == "--atlas-cuda-sched" && i + 1 < argc) {
+            cfg.cuda_sched = argv[++i];
         } else if (arg == "--atlas-gpu-layers" && i + 1 < argc) {
             cfg.gpu_expert_layers = std::stoi(argv[++i]);
             user_set_gpu_layers = true;
@@ -2560,24 +2655,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Auto-resolve primary Q4_K_M MTP model path
+    if (!atlas_configure_cuda_primary_ctx(cfg.cuda_sched)) {
+        std::fprintf(stderr, "Invalid CUDA scheduling mode: %s\n", cfg.cuda_sched.c_str());
+        return 1;
+    }
+
+    // Resolve the optional MTP model without embedding a machine-specific path.
     if (cfg.mtp_path.empty()) {
-        static const char * CANDIDATE_PATHS[] = {
-            "C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--unsloth--Qwen3.8-Flash-Next-GGUF\\snapshots\\38bb39ee97821de2c9009abb7e93950eec396e66d\\MTP\\mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf",
-            "C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--unsloth--Qwen3.8-Flash-Next-GGUF\\snapshots\\38bb39ee97821de2c9009abb7e93950eec396e66\\MTP\\mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf",
-            "C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--unsloth--Qwen3.8-Flash-Next-GGUF\\snapshots\\38bb39ee97821de2c9009abb7e93950eec396e66\\MTP\\mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
-        };
-        for (const char * p : CANDIDATE_PATHS) {
-            FILE * f = std::fopen(p, "rb");
+        const char * env_mtp_path = std::getenv("TENDOU_MTP_PATH");
+        if (env_mtp_path && env_mtp_path[0]) {
+            FILE * f = std::fopen(env_mtp_path, "rb");
             if (f) {
                 std::fclose(f);
-                cfg.mtp_path = p;
-                if (std::string(p).find("Q4_K_M") != std::string::npos) {
+                cfg.mtp_path = env_mtp_path;
+                if (cfg.mtp_path.find("Q4_K_M") != std::string::npos) {
                     cfg.mtp_quant = "Q4_K_M";
                 } else {
                     cfg.mtp_quant = "Q8_0";
                 }
-                break;
             }
         }
     }
@@ -2608,6 +2703,16 @@ int main(int argc, char ** argv) {
         cfg.mtp_location = "vram";
     } else if (cfg.mtp_mode == "ram") {
         cfg.mtp_location = "ram";
+    }
+
+    if (cfg.mtp_mode != "off") {
+        if (!std::getenv("ATLAS_MTP_UNION_CAP")) {
+#if defined(_WIN32)
+            _putenv_s("ATLAS_MTP_UNION_CAP", "6");
+#else
+            setenv("ATLAS_MTP_UNION_CAP", "6", 0);
+#endif
+        }
     }
 
     // Ensure optimal CPU MoE prefill threshold is active if not set by user environment
@@ -2787,10 +2892,8 @@ int main(int argc, char ** argv) {
         overrides.push_back({moe_pattern, ggml_backend_cpu_buffer_type()});
     }
 
-    bool has_spec_type = false;
-    for (auto t : params.speculative.types) {
-        if (t != COMMON_SPECULATIVE_TYPE_NONE) { has_spec_type = true; break; }
-    }
+    const bool is_spec_active = (cfg.mtp_mode != "off");
+    bool has_spec_type = is_spec_active;
 
     if (cfg.mtp_mode != "off") {
 #if defined(_WIN32)
@@ -2801,7 +2904,6 @@ int main(int argc, char ** argv) {
         if (std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == params.speculative.types.end()) {
             params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
         }
-        has_spec_type = true;
         params.speculative.draft.n_max = cfg.mtp_draft_n;
         params.speculative.draft.p_min = cfg.mtp_p_min;
         params.speculative.draft.cpuparams.n_threads = cfg.n_threads;
@@ -2816,14 +2918,18 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (has_spec_type) {
-        if (params.n_ubatch <= params.speculative.need_n_rs_seq()) {
-            std::fprintf(stderr, "Speculation requires ubatch larger than its recurrent rollback tail.\n");
-            return 1;
+    // When MTP is active, ensure n_rs_seq >= 2 so that recurrent state rollback is supported
+    // natively for speculative draft/verify without external state checkpoints.
+    // NOTE: Do NOT add DRAFT_MTP spec type or alter n_ubatch when mtp_mode="off" — doing so
+    // forces n_rs_seq >= 2 unconditionally and corrupts recurrent state at 64k+ context lengths,
+    // causing the model to emit only <|im_end|> (empty output).
+    if (cfg.mtp_mode != "off") {
+        if (std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == params.speculative.types.end()) {
+            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
         }
-        if (cfg.ipc_mode) {
-            std::fprintf(stderr, "[ATLAS] Speculative decoding is not implemented in IPC; use the CLI for MTP evaluation.\n");
-            return 1;
+        params.speculative.draft.n_max = cfg.mtp_draft_n;
+        if (params.n_ubatch <= params.speculative.need_n_rs_seq()) {
+            params.n_ubatch = params.speculative.need_n_rs_seq() + 1;
         }
         const auto output_limits = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
@@ -2892,8 +2998,12 @@ int main(int argc, char ** argv) {
         }
     }
 
-    const bool use_ckpt_tgt = spec && common_context_can_seq_rm(ctx) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-    const bool use_ckpt_dft = spec && ctx_dft && common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const auto rm_type_tgt = spec ? common_context_can_seq_rm(ctx) : COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    const bool use_ckpt_tgt = spec && (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+        (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_RS && (int)cfg.mtp_draft_n > (int)llama_n_rs_seq(ctx)));
+    const auto rm_type_dft = (spec && ctx_dft) ? common_context_can_seq_rm(ctx_dft) : COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    const bool use_ckpt_dft = spec && ctx_dft && (rm_type_dft == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+        (rm_type_dft == COMMON_CONTEXT_SEQ_RM_TYPE_RS && (int)cfg.mtp_draft_n > (int)llama_n_rs_seq(ctx_dft)));
     char desc[256] = {};
     llama_model_desc(model, desc, sizeof(desc));
     std::printf("[ATLAS] ====================================================\n");
@@ -2947,6 +3057,8 @@ int main(int argc, char ** argv) {
             int n_predict = 512;
             float temp = 0.7f;
             float top_p = 0.9f;
+            int top_k = 40;
+            float min_p = 0.0f;
             std::vector<std::string> stop;
         };
 
@@ -2986,6 +3098,8 @@ int main(int argc, char ** argv) {
                         r.n_predict = j.value("n_predict", 512);
                         r.temp = j.value("temp", 0.7f);
                         r.top_p = j.value("top_p", 0.9f);
+                        r.top_k = j.value("top_k", 40);
+                        r.min_p = j.value("min_p", 0.0f);
                         if (j.contains("stop") && j["stop"].is_array()) {
                             for (const auto & s : j["stop"]) {
                                 r.stop.push_back(s.get<std::string>());
@@ -3007,8 +3121,10 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> cached_prompt;
         std::vector<uint8_t> cached_state;
         std::vector<float> cached_logits;
+        std::vector<uint8_t> cached_spec_state;
         std::vector<llama_token> stable_prompt;
         std::vector<uint8_t> stable_state;
+        std::vector<uint8_t> stable_spec_state;
 
         while (is_running.load()) {
             IpcReq r;
@@ -3068,18 +3184,26 @@ int main(int argc, char ** argv) {
                 std::equal(cached_prompt.begin(), cached_prompt.end(), req_tokens.begin())) {
                 if (llama_state_set_data(ctx, cached_state.data(), cached_state.size()) == cached_state.size()) {
                     reused_tokens = cached_prompt.size();
+                    if (spec && !cached_spec_state.empty()) {
+                        common_speculative_set_state(spec.get(), 0, cached_spec_state);
+                    }
                 } else {
                     cached_prompt.clear();
                     cached_state.clear();
+                    cached_spec_state.clear();
                 }
             }
             if (reused_tokens == 0 && !stable_state.empty() && stable_prompt.size() < req_tokens.size() &&
                 std::equal(stable_prompt.begin(), stable_prompt.end(), req_tokens.begin())) {
                 if (llama_state_set_data(ctx, stable_state.data(), stable_state.size()) == stable_state.size()) {
                     reused_tokens = stable_prompt.size();
+                    if (spec && !stable_spec_state.empty()) {
+                        common_speculative_set_state(spec.get(), 0, stable_spec_state);
+                    }
                 } else {
                     stable_prompt.clear();
                     std::vector<uint8_t>().swap(stable_state);
+                    stable_spec_state.clear();
                 }
             }
             if (reused_tokens == 0) {
@@ -3089,13 +3213,22 @@ int main(int argc, char ** argv) {
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, -1);
             }
 
+            const size_t n_prefill_tokens = req_tokens.size();
+            if (spec && reused_tokens > n_prefill_tokens) {
+                reused_tokens = n_prefill_tokens;
+                llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos)n_prefill_tokens, -1);
+                if (ctx_dft) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, (llama_pos)n_prefill_tokens, -1);
+                }
+            }
+
             // Chunked prompt decode (respecting llama_n_batch and early cancellation)
             const int n_batch = llama_n_batch(ctx);
             size_t stable_end = 0;
             const size_t assistant_start = r.prompt.rfind("<|im_start|>assistant");
             if (cfg.prompt_cache_mb > 0 && assistant_start != std::string::npos) {
                 const auto prefix = common_tokenize(ctx, r.prompt.substr(0, assistant_start), add_bos, true);
-                while (stable_end < prefix.size() && stable_end < req_tokens.size() &&
+                while (stable_end < prefix.size() && stable_end < n_prefill_tokens &&
                        prefix[stable_end] == req_tokens[stable_end]) ++stable_end;
                 // Reuse an existing batch boundary; do not add another MoE pass for short prompts.
                 stable_end = stable_end / size_t(n_batch) * size_t(n_batch);
@@ -3105,14 +3238,17 @@ int main(int argc, char ** argv) {
             const auto metrics_before = runtime.memory_manager.get_metrics();
             const auto t_prefill_loop_start = atlas::clock::now();
             double prefill_eval_ms = 0.0;
-            for (int i = (int)reused_tokens; i < (int)req_tokens.size();) {
+            for (int i = (int)reused_tokens; i < (int)n_prefill_tokens;) {
                 if (cancel_cur.load()) {
                     prompt_ok = false;
                     break;
                 }
-                int n_eval = std::min(n_batch, (int)req_tokens.size() - i);
+                int n_eval = std::min(n_batch, (int)n_prefill_tokens - i);
                 if (size_t(i) < stable_end) n_eval = std::min(n_eval, int(stable_end) - i);
-                llama_batch p_batch = llama_batch_get_one(req_tokens.data() + i, n_eval);
+                llama_batch p_batch = llama_batch_init(n_eval, 0, 1);
+                for (int k = 0; k < n_eval; ++k) {
+                    common_batch_add(p_batch, req_tokens[i + k], i + k, { 0 }, (i + k == (int)n_prefill_tokens - 1));
+                }
                 const auto t_chunk_eval0 = atlas::clock::now();
                 if (reused_tokens > 0) {
 #if defined(_WIN32)
@@ -3130,31 +3266,46 @@ int main(int argc, char ** argv) {
 #endif
                 }
                 if (decode_ret != 0) {
+                    llama_batch_free(p_batch);
                     prompt_ok = false;
                     break;
                 }
+                if (spec) {
+                    if (!common_speculative_process(spec.get(), p_batch)) {
+                        llama_batch_free(p_batch);
+                        prompt_ok = false;
+                        break;
+                    }
+                }
+                llama_batch_free(p_batch);
                 prefill_eval_ms += atlas::elapsed_ms(t_chunk_eval0, atlas::clock::now());
                 i += n_eval;
                 // Chat history omits the final thinking prefix. Keep a checkpoint before it.
                 if (stable_end >= 8 && size_t(i) == stable_end) {
                     stable_prompt.clear();
                     std::vector<uint8_t>().swap(stable_state);
+                    stable_spec_state.clear();
                     const auto t_cp = atlas::clock::now();
                     const size_t size = llama_state_get_size(ctx);
                     if (size > 0 && size <= cfg.prompt_cache_mb * 1024 * 1024 / 2) {
                         cached_prompt.clear();
                         std::vector<uint8_t>().swap(cached_state);
                         cached_logits.clear();
+                        cached_spec_state.clear();
                         try {
                             stable_state.resize(size);
                             if (llama_state_get_data(ctx, stable_state.data(), size) == size) {
                                 stable_prompt.assign(req_tokens.begin(), req_tokens.begin() + stable_end);
+                                if (spec) {
+                                    common_speculative_get_state(spec.get(), 0, stable_spec_state);
+                                }
                             } else {
                                 std::vector<uint8_t>().swap(stable_state);
                             }
                         } catch (const std::bad_alloc &) {
                             stable_prompt.clear();
                             std::vector<uint8_t>().swap(stable_state);
+                            stable_spec_state.clear();
                         }
                     }
                     checkpoint_ms += atlas::elapsed_ms(t_cp, atlas::clock::now());
@@ -3176,8 +3327,15 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
+            std::vector<llama_token> prompt_tgt;
+            if (spec) {
+                prompt_tgt.assign(req_tokens.begin(), req_tokens.begin() + n_prefill_tokens);
+                common_speculative_begin(spec.get(), 0, prompt_tgt);
+            }
+
             runtime.saw_decode = true;
-            // Save the complete state: a KV-only prefix rollback is unsafe for recurrent models.
+            // Save the complete prefill state (KV + spec pending_h) for multi-turn cache reuse.
+            // Both spec and non-spec paths benefit: spec mode skips full prefill on cache hit.
             if (cfg.prompt_cache_mb > 0 && req_tokens.size() >= 8 && reused_tokens != req_tokens.size()) {
                 const auto t_cp2 = atlas::clock::now();
                 const size_t state_size = llama_state_get_size(ctx);
@@ -3187,7 +3345,9 @@ int main(int argc, char ** argv) {
                         cached_prompt.clear();
                         // This fork serializes memory only, despite the public header's logits comment.
                         const float * prompt_logits = llama_get_logits(ctx);
-                        cached_logits.assign(prompt_logits, prompt_logits + llama_vocab_n_tokens(vocab));
+                        if (prompt_logits) {
+                            cached_logits.assign(prompt_logits, prompt_logits + llama_vocab_n_tokens(vocab));
+                        }
                         if (cached_state.capacity() < state_size) {
                             std::vector<uint8_t>().swap(cached_state);
                             cached_state.reserve(state_size);
@@ -3195,6 +3355,12 @@ int main(int argc, char ** argv) {
                         cached_state.resize(state_size);
                         if (llama_state_get_data(ctx, cached_state.data(), state_size) == state_size) {
                             cached_prompt = req_tokens;
+                            // Also save the speculative hidden state (pending_h) so next turn can
+                            // restore the MTP draft head without re-processing the prompt.
+                            cached_spec_state.clear();
+                            if (spec) {
+                                common_speculative_get_state(spec.get(), 0, cached_spec_state);
+                            }
                             if (stable_state.capacity() < state_size) {
                                 std::vector<uint8_t>().swap(stable_state);
                                 stable_state.reserve(state_size);
@@ -3202,12 +3368,17 @@ int main(int argc, char ** argv) {
                             stable_state.resize(state_size);
                             std::memcpy(stable_state.data(), cached_state.data(), state_size);
                             stable_prompt = req_tokens;
+                            if (spec && !cached_spec_state.empty()) {
+                                stable_spec_state = cached_spec_state;
+                            }
                         } else {
                             cached_state.clear();
+                            cached_spec_state.clear();
                         }
                     } catch (const std::bad_alloc &) {
                         cached_prompt.clear();
                         std::vector<uint8_t>().swap(cached_state);
+                        cached_spec_state.clear();
                     }
                 }
                 checkpoint_ms += atlas::elapsed_ms(t_cp2, atlas::clock::now());
@@ -3245,123 +3416,398 @@ int main(int argc, char ** argv) {
 
             std::vector<llama_token> session_tokens = req_tokens;
 
-            while (generated < r.n_predict) {
-                if (cancel_cur.load()) {
-                    finish_reason = "cancelled";
-                    break;
-                }
-                if ((int)req_tokens.size() + generated >= n_ctx_total) {
-                    finish_reason = "length";
-                    break;
-                }
+            uint64_t req_drafted = 0;
+            uint64_t req_accepted = 0;
+            double req_draft_ms = 0.0;
+            double req_verify_ms = 0.0;
 
-                float * logits = generated == 0 && reused_tokens == req_tokens.size()
+            if (spec) {
+                common_params_sampling sparams;
+                sparams.temp = r.temp;
+                sparams.top_p = r.top_p;
+                sparams.top_k = r.top_k > 0 ? r.top_k : (r.temp <= 0.01f ? 1 : 40);
+                sparams.min_p = r.min_p;
+                common_sampler_ptr smpl(common_sampler_init(model, sparams));
+
+                // Emit Token 1 immediately from prefill logits to eliminate the speculative TTFT lag
+                float * logits = (generated == 0 && reused_tokens == req_tokens.size())
                     ? cached_logits.data() : llama_get_logits(ctx);
-                llama_token tok = 0;
-
+                llama_token tok1 = 0;
                 if (r.temp <= 0.01f) {
                     int best = 0;
                     for (int i = 1; i < vocab_size; ++i) {
                         if (logits[i] > logits[best]) best = i;
                     }
-                    tok = static_cast<llama_token>(best);
+                    tok1 = static_cast<llama_token>(best);
                 } else {
-                    float max_l = logits[0];
-                    for (int i = 1; i < vocab_size; ++i) if (logits[i] > max_l) max_l = logits[i];
-
-                    std::vector<std::pair<float, int>> probs;
-                    probs.reserve(vocab_size);
-                    float sum = 0.0f;
-                    for (int i = 0; i < vocab_size; ++i) {
-                        float p = std::exp((logits[i] - max_l) / r.temp);
-                        probs.push_back({p, i});
-                        sum += p;
-                    }
-                    for (auto & p : probs) p.first /= sum;
-
-                    std::sort(probs.begin(), probs.end(), [](const auto & a, const auto & b) {
-                        return a.first > b.first;
-                    });
-
-                    float cum = 0.0f;
-                    int cutoff = (int)probs.size();
-                    for (size_t i = 0; i < probs.size(); ++i) {
-                        cum += probs[i].first;
-                        if (cum >= r.top_p) {
-                            cutoff = (int)i + 1;
-                            break;
-                        }
-                    }
-
-                    std::uniform_real_distribution<float> dist(0.0f, cum);
-                    float rnd = dist(rng);
-                    tok = probs[0].second;
-                    for (int i = 0; i < cutoff; ++i) {
-                        rnd -= probs[i].first;
-                        if (rnd <= 0.0f) {
-                            tok = probs[i].second;
-                            break;
-                        }
-                    }
+                    tok1 = common_sampler_sample(smpl.get(), ctx, -1);
                 }
+                common_sampler_accept(smpl.get(), tok1, true);
 
-                std::string piece = common_token_to_piece(ctx, tok);
+                std::string piece = common_token_to_piece(ctx, tok1);
                 full_response += piece;
-                ++generated;
-                session_tokens.push_back(tok);
-                runtime.quality_estimator.record_token(tok);
                 if (ttft_ms == 0.0) ttft_ms = atlas::elapsed_ms(request_start, atlas::clock::now());
-
-                if (tok == eos || llama_vocab_is_eog(vocab, tok)) {
-                    finish_reason = "stop";
-                    llama_batch dec_batch = llama_batch_get_one(&tok, 1);
-                    llama_decode(ctx, dec_batch);
-                    break;
-                }
-
-                bool matched_stop = false;
-                for (const auto & s : r.stop) {
-                    if (!s.empty() && full_response.size() >= s.size() &&
-                        full_response.compare(full_response.size() - s.size(), s.size(), s) == 0) {
-                        matched_stop = true;
-                        break;
-                    }
-                }
-                if (matched_stop) {
-                    finish_reason = "stop";
-                    llama_batch dec_batch = llama_batch_get_one(&tok, 1);
-                    llama_decode(ctx, dec_batch);
-                    break;
-                }
+                ++generated;
+                session_tokens.push_back(tok1);
+                runtime.quality_estimator.record_token(tok1);
 
                 nlohmann::json tok_event = {
                     {"event", "token"},
                     {"id", r.id},
                     {"token", piece},
-                    {"token_id", (int)tok}
+                    {"token_id", (int)tok1}
                 };
                 std::printf("%s\n", tok_event.dump().c_str());
                 std::fflush(stdout);
-                // No consumer needs logits after the final requested token.
-                if (generated >= r.n_predict) {
+
+                bool early_stop = false;
+                if (tok1 == eos || llama_vocab_is_eog(vocab, tok1)) {
+                    finish_reason = "stop";
+                    early_stop = true;
+                }
+                if (!early_stop && generated >= r.n_predict) {
+                    finish_reason = "length";
+                    early_stop = true;
+                }
+
+                if (!early_stop) {
+                    llama_token id_last = tok1;
+                    int n_past = (int)n_prefill_tokens;
+                    llama_tokens draft;
+                    common_prompt_checkpoint ckpt;
+                    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+
+                    int spec_n_max = common_speculative_n_max(spec.get());
+                    if (spec_n_max <= 0) spec_n_max = common_speculative_n_max(&params.speculative);
+                    if (spec_n_max <= 0) spec_n_max = cfg.mtp_draft_n;
+                    if (runtime.current_draft_n <= 0) runtime.current_draft_n = spec_n_max;
+
+                    while (generated < r.n_predict) {
+                        if (cancel_cur.load()) {
+                            finish_reason = "cancelled";
+                            break;
+                        }
+                        if (n_past + runtime.current_draft_n >= n_ctx_total) {
+                            finish_reason = "length";
+                            break;
+                        }
+
+                        if (draft.empty()) {
+                            ckpt.update_pos(
+                                prompt_tgt.size(),
+                            llama_memory_seq_pos_min(llama_get_memory(ctx), 0),
+                            llama_memory_seq_pos_max(llama_get_memory(ctx), 0));
+
+                        if (ctx_dft && use_ckpt_dft) {
+                            ckpt.update_dft(ctx_dft, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+
+                        int n_draft_max = (int) llama_n_batch(ctx) - 2;
+                        n_draft_max = std::min(n_draft_max, runtime.current_draft_n);
+                        n_draft_max = std::min(n_draft_max, r.n_predict - generated - 1);
+                        n_draft_max = std::max(n_draft_max, 0);
+
+                        if (n_draft_max > 0) {
+                            const auto t_d0 = atlas::clock::now();
+                            common_speculative_get_draft_params(spec.get(), 0) = {
+                                /* .drafting = */ true,
+                                /* .n_max    = */ n_draft_max,
+                                /* .n_past   = */ n_past,
+                                /* .id_last  = */ id_last,
+                                /* .prompt   = */ &prompt_tgt,
+                                /* .result   = */ &draft,
+                            };
+                            common_speculative_draft(spec.get());
+                            req_draft_ms += atlas::elapsed_ms(t_d0, atlas::clock::now());
+                            req_drafted += draft.size();
+                        }
+
+                        if (!draft.empty() && use_ckpt_tgt) {
+                            ckpt.update_tgt(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+
+                        if (ctx_dft) {
+                            if (use_ckpt_dft) {
+                                ckpt.load_dft(ctx_dft, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            }
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, ckpt.pos_max + 1, -1);
+                        }
+                    }
+
+                    // Atlas Multi-Token Working Set (MTWS) Early Planning & Prefetch
+                    if (cfg.enable_mtws && !draft.empty()) {
+                        const auto t_plan0 = atlas::clock::now();
+                        runtime.current_plan = runtime.mtws_planner.build_working_set(
+                            draft, runtime.token_correlator, runtime.last_layer_experts);
+                        runtime.mtws_planner.prefetch_plan(runtime.current_plan, &runtime.current_timeline);
+                        runtime.memory_manager.get_metrics().total_prefetch_ms += atlas::elapsed_ms(t_plan0, atlas::clock::now());
+                    }
+
+                    // Target model evaluation over [id_last, draft[0], draft[1], ...]
+                    common_batch_clear(batch_tgt);
+                    common_batch_add(batch_tgt, id_last, n_past++, { 0 }, true);
+                    for (size_t i = 0; i < draft.size(); ++i) {
+                        common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
+                    }
+
+                    runtime.current_batch_tokens.clear();
+                    runtime.current_batch_tokens.push_back(id_last);
+                    for (auto tok : draft) runtime.current_batch_tokens.push_back(tok);
+
+                    const auto t_v0 = atlas::clock::now();
+                    if (llama_decode(ctx, batch_tgt) != 0) {
+                        finish_reason = "error";
+                        break;
+                    }
+                    const double verify_ms = atlas::elapsed_ms(t_v0, atlas::clock::now());
+                    req_verify_ms += verify_ms;
+
+                    if (!common_speculative_process(spec.get(), batch_tgt)) {
+                        finish_reason = "error";
+                        break;
+                    }
+
+                    common_sampler_ptr smpl_save;
+                    if (use_ckpt_tgt) {
+                        smpl_save.reset(common_sampler_clone(smpl.get()));
+                    }
+
+                    const size_t n_draft = draft.size();
+                    auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx, draft);
+
+                    // Adaptive Policy
+                    if (cfg.adaptive_fallback && n_draft > 0) {
+                        double batch_acc = double(ids.size() - 1) / double(n_draft);
+                        runtime.rolling_acceptance = 0.70 * runtime.rolling_acceptance + 0.30 * batch_acc;
+                        if (runtime.rolling_acceptance > 0.55 && runtime.current_draft_n < spec_n_max) {
+                            runtime.current_draft_n++;
+                            runtime.streak_low_acceptance = 0;
+                        } else if (runtime.rolling_acceptance < 0.25 && runtime.current_draft_n > 1) {
+                            runtime.streak_low_acceptance++;
+                            if (runtime.streak_low_acceptance >= 2) {
+                                runtime.current_draft_n = std::max(1, runtime.current_draft_n - 1);
+                                runtime.streak_low_acceptance = 0;
+                            }
+                        }
+                    }
+
+                    if (use_ckpt_tgt && ids.size() - 1 < n_draft) {
+                        // Partial acceptance: restore target & draft state checkpoints
+                        draft = std::move(ids);
+                        ckpt.load_tgt(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        llama_memory_seq_rm(llama_get_memory(ctx), 0, ckpt.pos_max + 1, -1);
+
+                        if (ctx_dft) {
+                            ckpt.load_dft(ctx_dft, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, ckpt.pos_max + 1, -1);
+                        }
+
+                        prompt_tgt.resize(ckpt.n_tokens);
+                        smpl = std::move(smpl_save);
+                        n_past = (int) prompt_tgt.size();
+                        continue;
+                    }
+
+                    common_speculative_accept(spec.get(), 0, ids.size() - 1);
+                    n_past += ids.size() - 1;
+                    req_accepted += (ids.size() - 1);
+
+                    bool should_stop = false;
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        prompt_tgt.push_back(id_last);
+                        id_last = ids[i];
+                        ++generated;
+                        session_tokens.push_back(id_last);
+                        runtime.quality_estimator.record_token(id_last);
+
+                        std::string piece = common_token_to_piece(ctx, id_last);
+                        full_response += piece;
+                        if (ttft_ms == 0.0) ttft_ms = atlas::elapsed_ms(request_start, atlas::clock::now());
+
+                        runtime.finish_token_timeline(generated, verify_ms / ids.size(), 0.1, 0.0);
+                        if (cfg.gpu_first) {
+                            runtime.execute_gpu_first_token(generated, runtime.last_layer_experts);
+                        }
+
+                        nlohmann::json tok_event = {
+                            {"event", "token"},
+                            {"id", r.id},
+                            {"token", piece},
+                            {"token_id", (int)id_last}
+                        };
+                        std::printf("%s\n", tok_event.dump().c_str());
+                        std::fflush(stdout);
+
+                        if (id_last == eos || llama_vocab_is_eog(vocab, id_last)) {
+                            finish_reason = "stop";
+                            should_stop = true;
+                            break;
+                        }
+
+                        bool matched_stop = false;
+                        for (const auto & s : r.stop) {
+                            if (!s.empty() && full_response.size() >= s.size() &&
+                                full_response.compare(full_response.size() - s.size(), s.size(), s) == 0) {
+                                matched_stop = true;
+                                break;
+                            }
+                        }
+                        if (matched_stop) {
+                            finish_reason = "stop";
+                            should_stop = true;
+                            break;
+                        }
+
+                        if (generated >= r.n_predict) {
+                            finish_reason = "length";
+                            should_stop = true;
+                            break;
+                        }
+                    }
+
+                    draft.clear();
+
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, -1) ||
+                        (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, n_past, -1))) {
+                        std::fprintf(stderr, "[ATLAS] speculative state rollback failed\n");
+                        finish_reason = "error";
+                        break;
+                    }
+
+                    if (should_stop) break;
+                }
+
+                llama_batch_free(batch_tgt);
+                }
+
+                auto & m = runtime.memory_manager.get_metrics();
+                m.mtp_mode = cfg.mtp_mode;
+                m.mtp_quant = cfg.mtp_quant;
+                m.mtp_location = cfg.mtp_location;
+                m.mtp_draft_n = cfg.mtp_draft_n;
+                m.spec_draft_tokens += req_drafted;
+                m.spec_accepted_tokens += req_accepted;
+                m.spec_draft_time_ms += req_draft_ms;
+                m.spec_verify_time_ms += req_verify_ms;
+            } else {
+                while (generated < r.n_predict) {
+                    if (cancel_cur.load()) {
+                        finish_reason = "cancelled";
+                        break;
+                    }
+                    if ((int)req_tokens.size() + generated >= n_ctx_total) {
+                        finish_reason = "length";
+                        break;
+                    }
+
+                    float * logits = generated == 0 && reused_tokens == req_tokens.size()
+                        ? cached_logits.data() : llama_get_logits(ctx);
+                    llama_token tok = 0;
+
+                    if (r.temp <= 0.01f) {
+                        int best = 0;
+                        for (int i = 1; i < vocab_size; ++i) {
+                            if (logits[i] > logits[best]) best = i;
+                        }
+                        tok = static_cast<llama_token>(best);
+                    } else {
+                        float max_l = logits[0];
+                        for (int i = 1; i < vocab_size; ++i) if (logits[i] > max_l) max_l = logits[i];
+
+                        std::vector<std::pair<float, int>> probs;
+                        probs.reserve(vocab_size);
+                        float sum = 0.0f;
+                        for (int i = 0; i < vocab_size; ++i) {
+                            float p = std::exp((logits[i] - max_l) / r.temp);
+                            probs.push_back({p, i});
+                            sum += p;
+                        }
+                        for (auto & p : probs) p.first /= sum;
+
+                        std::sort(probs.begin(), probs.end(), [](const auto & a, const auto & b) {
+                            return a.first > b.first;
+                        });
+
+                        float cum = 0.0f;
+                        int cutoff = (int)probs.size();
+                        for (size_t i = 0; i < probs.size(); ++i) {
+                            cum += probs[i].first;
+                            if (cum >= r.top_p) {
+                                cutoff = (int)i + 1;
+                                break;
+                            }
+                        }
+
+                        std::uniform_real_distribution<float> dist(0.0f, cum);
+                        float rnd = dist(rng);
+                        tok = probs[0].second;
+                        for (int i = 0; i < cutoff; ++i) {
+                            rnd -= probs[i].first;
+                            if (rnd <= 0.0f) {
+                                tok = probs[i].second;
+                                break;
+                            }
+                        }
+                    }
+
+                    std::string piece = common_token_to_piece(ctx, tok);
+                    full_response += piece;
+                    ++generated;
+                    session_tokens.push_back(tok);
+                    runtime.quality_estimator.record_token(tok);
+                    if (ttft_ms == 0.0) ttft_ms = atlas::elapsed_ms(request_start, atlas::clock::now());
+
+                    if (tok == eos || llama_vocab_is_eog(vocab, tok)) {
+                        finish_reason = "stop";
+                        llama_batch dec_batch = llama_batch_get_one(&tok, 1);
+                        llama_decode(ctx, dec_batch);
+                        break;
+                    }
+
+                    bool matched_stop = false;
+                    for (const auto & s : r.stop) {
+                        if (!s.empty() && full_response.size() >= s.size() &&
+                            full_response.compare(full_response.size() - s.size(), s.size(), s) == 0) {
+                            matched_stop = true;
+                            break;
+                        }
+                    }
+                    if (matched_stop) {
+                        finish_reason = "stop";
+                        llama_batch dec_batch = llama_batch_get_one(&tok, 1);
+                        llama_decode(ctx, dec_batch);
+                        break;
+                    }
+
+                    nlohmann::json tok_event = {
+                        {"event", "token"},
+                        {"id", r.id},
+                        {"token", piece},
+                        {"token_id", (int)tok}
+                    };
+                    std::printf("%s\n", tok_event.dump().c_str());
+                    std::fflush(stdout);
+                    // No consumer needs logits after the final requested token.
+                    if (generated >= r.n_predict) {
+                        llama_batch dec_batch = llama_batch_get_one(&tok, 1);
+                        llama_decode(ctx, dec_batch);
+                        break;
+                    }
+
+                    runtime.current_batch_tokens = { tok };
                     llama_batch dec_batch = llama_batch_get_one(&tok, 1);
-                    llama_decode(ctx, dec_batch);
-                    break;
-                }
+                    const auto t_dec0 = atlas::clock::now();
+                    int decode_res = llama_decode(ctx, dec_batch);
+                    const double decode_ms = atlas::elapsed_ms(t_dec0, atlas::clock::now());
+                    runtime.finish_token_timeline(generated, decode_ms, 0.0, 0.0);
+                    if (cfg.gpu_first) {
+                        runtime.execute_gpu_first_token(generated, runtime.last_layer_experts);
+                    }
 
-                runtime.current_batch_tokens = { tok };
-                llama_batch dec_batch = llama_batch_get_one(&tok, 1);
-                const auto t_dec0 = atlas::clock::now();
-                int decode_res = llama_decode(ctx, dec_batch);
-                const double decode_ms = atlas::elapsed_ms(t_dec0, atlas::clock::now());
-                runtime.finish_token_timeline(generated, decode_ms, 0.0, 0.0);
-                if (cfg.gpu_first) {
-                    runtime.execute_gpu_first_token(generated, runtime.last_layer_experts);
-                }
-
-                if (decode_res != 0) {
-                    finish_reason = "error";
-                    break;
+                    if (decode_res != 0) {
+                        finish_reason = "error";
+                        break;
+                    }
                 }
             }
 
@@ -3382,6 +3828,12 @@ int main(int argc, char ** argv) {
                         cached_state.resize(state_size);
                         if (llama_state_get_data(ctx, cached_state.data(), state_size) == state_size) {
                             cached_prompt = session_tokens;
+                            // Persist speculative head state after generation so the next
+                            // turn with same prefix can skip draft model re-warm.
+                            cached_spec_state.clear();
+                            if (spec) {
+                                common_speculative_get_state(spec.get(), 0, cached_spec_state);
+                            }
                         }
                     } catch (const std::bad_alloc &) {
                         // ignore bad alloc, stable_state is still intact
@@ -3404,6 +3856,12 @@ int main(int argc, char ** argv) {
                 {"staging_capacity_bytes", runtime.host_staging_pool.get_capacity()},
                 {"dynamic_expert_h2d", cfg.p3_async_transfer},
                 {"p2_gpu_binding", cfg.p2_expert_gpu_binding},
+                {"spec_draft_tokens", req_drafted},
+                {"spec_accepted_tokens", req_accepted},
+                {"spec_draft_time_ms", req_draft_ms},
+                {"spec_verify_time_ms", req_verify_ms},
+                {"spec_acceptance_rate", req_drafted > 0 ? double(req_accepted) / double(req_drafted) : 0.0},
+                {"spec_effective_tps", (req_verify_ms + req_draft_ms) > 0.0 ? double(generated) / ((req_verify_ms + req_draft_ms) * 1e-3) : 0.0},
                 {"ttft_ms", ttft_ms},
                 {"prefill_io_ms", prefill_io_ms},
                 {"prefill_compute_ms", prefill_compute_ms},
@@ -3443,29 +3901,24 @@ int main(int argc, char ** argv) {
 
     // Prompt evaluation
     const auto t_prompt_start = atlas::clock::now();
-    if (spec) {
-        if (tokens.size() > 1) {
-            llama_batch batch_prompt = llama_batch_init(tokens.size(), 0, 1);
-            for (size_t i = 0; i < tokens.size() - 1; ++i) {
-                common_batch_add(batch_prompt, tokens[i], i, { seq_id }, false);
-            }
-            if (llama_decode(ctx, batch_prompt) != 0 || !common_speculative_process(spec.get(), batch_prompt)) {
-                llama_batch_free(batch_prompt);
-                std::fprintf(stderr, "[ATLAS] speculative prefill failed\n");
-                return 4;
-            }
-            llama_batch_free(batch_prompt);
-            prompt_tgt.assign(tokens.begin(), tokens.end() - 1);
-        } else {
-            prompt_tgt.clear();
-        }
-        common_speculative_begin(spec.get(), seq_id, prompt_tgt);
-    } else {
-        llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
-        if (llama_decode(ctx, batch) != 0) {
-            std::printf("[ATLAS] error: prompt decode failed\n"); return 4;
-        }
+    llama_batch batch_prompt = llama_batch_init(tokens.size(), 0, 1);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        common_batch_add(batch_prompt, tokens[i], i, { seq_id }, i == tokens.size() - 1);
     }
+    if (llama_decode(ctx, batch_prompt) != 0) {
+        llama_batch_free(batch_prompt);
+        std::printf("[ATLAS] error: prompt decode failed\n"); return 4;
+    }
+    if (spec) {
+        if (!common_speculative_process(spec.get(), batch_prompt)) {
+            llama_batch_free(batch_prompt);
+            std::fprintf(stderr, "[ATLAS] speculative prefill failed\n");
+            return 4;
+        }
+        prompt_tgt = tokens;
+        common_speculative_begin(spec.get(), seq_id, prompt_tgt);
+    }
+    llama_batch_free(batch_prompt);
     const auto t_prompt_end = atlas::clock::now();
     const double prompt_sec = std::chrono::duration<double>(t_prompt_end - t_prompt_start).count();
 
@@ -3484,23 +3937,43 @@ int main(int argc, char ** argv) {
     common_sampler_ptr smpl(common_sampler_init(model, params.sampling));
 
     if (spec) {
-        llama_token id_last = tokens.back();
-        int n_past = int(tokens.size()) - 1;
-        llama_tokens draft;
-        common_prompt_checkpoint ckpt;
-        llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+        // Emit Token 1 immediately from prefill logits to eliminate the speculative TTFT lag
+        const llama_token tok1 = common_sampler_sample(smpl.get(), ctx, -1);
+        common_sampler_accept(smpl.get(), tok1, true);
+
+        std::string piece = common_token_to_piece(ctx, tok1);
+        std::fwrite(piece.data(), 1, piece.size(), stdout);
+        std::fflush(stdout);
+
+        ++generated;
+        first_output = atlas::clock::now();
+        last_output = first_output;
+        runtime.quality_estimator.record_token(tok1);
 
         uint64_t total_drafted = 0;
         uint64_t total_accepted = 0;
         double total_draft_ms = 0.0;
         double total_verify_ms = 0.0;
 
-        int spec_n_max = common_speculative_n_max(spec.get());
-        if (spec_n_max <= 0) spec_n_max = common_speculative_n_max(&params.speculative);
-        if (spec_n_max <= 0) spec_n_max = cfg.mtp_draft_n;
-        if (runtime.current_draft_n <= 0) runtime.current_draft_n = spec_n_max;
+        bool early_stop = false;
+        if ((!params.sampling.ignore_eos && (tok1 == eos || llama_vocab_is_eog(vocab, tok1))) ||
+            generated >= params.n_predict) {
+            early_stop = true;
+        }
 
-        while (generated < params.n_predict) {
+        if (!early_stop) {
+            llama_token id_last = tok1;
+            int n_past = int(tokens.size());
+            llama_tokens draft;
+            common_prompt_checkpoint ckpt;
+            llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx), 0, 1);
+
+            int spec_n_max = common_speculative_n_max(spec.get());
+            if (spec_n_max <= 0) spec_n_max = common_speculative_n_max(&params.speculative);
+            if (spec_n_max <= 0) spec_n_max = cfg.mtp_draft_n;
+            if (runtime.current_draft_n <= 0) runtime.current_draft_n = spec_n_max;
+
+            while (generated < params.n_predict) {
             if (draft.empty()) {
                 ckpt.update_pos(
                     prompt_tgt.size(),
@@ -3701,6 +4174,7 @@ int main(int argc, char ** argv) {
         }
 
         llama_batch_free(batch_tgt);
+        }
 
         auto & m = runtime.memory_manager.get_metrics();
         m.mtp_mode = cfg.mtp_mode;

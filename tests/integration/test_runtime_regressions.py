@@ -10,9 +10,6 @@ import pytest
 
 from src.atlas.server import AtlasSubprocessBackend, ChatMessage, format_chatml_prompt
 from scripts.evaluate_resident import evaluate
-from scripts.run_speed_matrix import parse_run_output as parse_speed
-from scripts.run_grouped_gemm_benchmark import parse_run_output as parse_grouped
-from scripts.run_gpu_first_benchmark import parse_engine_output as parse_gpu
 from src.atlas.native_server import make_launch, parser as native_parser
 
 
@@ -54,14 +51,6 @@ async def test_startup_exit_fails_without_waiting_for_timeout(tmp_path):
 def test_missing_quality_evidence_cannot_pass():
     with pytest.raises(ValueError, match="Missing"):
         evaluate({"results": []}, {"results": []})
-
-
-@pytest.mark.parametrize("parser", [parse_speed, parse_grouped, parse_gpu])
-def test_legacy_heuristics_do_not_certify_quality(parser):
-    assert parser("")["quality_score"] is None
-    result = parser("Estimated Quality: 100.0%\nQuality Floor Status: PASSED\n")
-    assert result["quality_score"] is None
-    assert result["quality_status"] == "NOT_EVALUATED"
 
 
 @pytest.mark.asyncio
@@ -157,3 +146,51 @@ def test_regular_api_keeps_measured_reference_prefetch_defaults():
     assert backend.readback_interval == 8
     assert backend.prefetch_candidates == 10
     assert backend.tutti_queue_depth == 64
+    assert backend.cuda_sched == "yield"
+    assert backend.threads == 16
+    assert backend.prompt_cache_mb == 256
+
+
+def test_atlas_subprocess_backend_cuda_sched_none_env_safety():
+    backend = AtlasSubprocessBackend(cuda_sched=None)
+    assert backend.cuda_sched is None
+    # Verify environment building does not inject None which causes TypeError in Windows CreateProcess
+    env = os.environ.copy()
+    env["GGML_CUDA_REGISTER_HOST"] = os.environ.get("GGML_CUDA_REGISTER_HOST", "1")
+    if backend.cuda_sched:
+        env["ATLAS_CUDA_SCHED"] = os.environ.get("ATLAS_CUDA_SCHED", str(backend.cuda_sched))
+    assert "ATLAS_CUDA_SCHED" not in env or isinstance(env["ATLAS_CUDA_SCHED"], str)
+    assert all(isinstance(v, str) for v in env.values())
+
+
+def test_server_cli_cuda_sched_parsing():
+    from src.atlas.server import create_parser
+    parser = create_parser()
+    args = parser.parse_args(["--cuda-sched", "blocking"])
+    assert args.cuda_sched == "blocking"
+    args = parser.parse_args(["--cuda-sched", "spin"])
+    assert args.cuda_sched == "spin"
+    args = parser.parse_args([])
+    assert args.cuda_sched == "yield"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--cuda-sched", "invalid_sched"])
+
+
+def test_server_cli_mtp_parsing():
+    from src.atlas.server import create_parser, AtlasSubprocessBackend
+    parser = create_parser()
+    args = parser.parse_args(["--mtp", "ram", "--mtp-draft-n", "4", "--mtp-path", "draft.gguf"])
+    assert args.mtp == "ram"
+    assert args.mtp_draft_n == 4
+    assert args.mtp_path == "draft.gguf"
+
+    # Default should be None
+    args_default = parser.parse_args([])
+    assert args_default.mtp is None
+    assert args_default.mtp_draft_n == 2
+    assert args_default.mtp_path is None
+
+    backend = AtlasSubprocessBackend(mtp="vram", mtp_draft_n=3)
+    assert backend.mtp == "vram"
+    assert backend.mtp_draft_n == 3

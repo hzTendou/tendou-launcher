@@ -1,4 +1,4 @@
-# Atlas Engine V1 — Python Package Requirements
+# tendou launcher — Python package requirements
 # Tested and verified on Python 3.12 (Windows x86_64)
 
 # --- Core Server Runtime & OpenAI-Compatible API ---

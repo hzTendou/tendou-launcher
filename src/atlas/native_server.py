@@ -47,7 +47,7 @@ def parser():
     p.add_argument("--mtp", choices=["off", "ram", "dense-gpu"], default="ram")
     p.add_argument("--draft-n", type=int, choices=range(1, 9), default=1)
     p.add_argument("--ctx-size", type=int, default=2048)
-    p.add_argument("--threads", type=int, default=14)
+    p.add_argument("--threads", type=int, default=16)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8001)
     return p

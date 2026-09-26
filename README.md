@@ -220,9 +220,11 @@ python atlas_server.py `
 | `TENDOU_MTP_PATH` | Optional MTP GGUF used with `--mtp` |
 | `TENDOU_MODEL_BLOB_1..3` | Shard blobs for experimental asynchronous page warming |
 
-For file-based configuration, copy
-[`config/runtime_default.example.json`](config/runtime_default.example.json) to
-`config/runtime_default.json`. The active local file is ignored by Git.
+[`config/runtime_default.example.json`](config/runtime_default.example.json)
+documents a complete local research profile. Copy it to
+`config/runtime_default.json` for local tooling, but note that the API server
+does not load this file automatically; pass server settings through environment
+variables or CLI flags. The active local file is ignored by Git.
 
 ## OpenCode
 
