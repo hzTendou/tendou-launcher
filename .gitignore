@@ -5,3 +5,9 @@ __pycache__/
 .venv*/
 .pytest_cache/
 checkpoints/*/bin/
+
+# Local agent memory and development planning
+AGENT.md
+AGENTS.md
+docs/NEXT_STEPS.md
+docs/agent-history.md
