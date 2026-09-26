@@ -1,287 +1,327 @@
-# tendou launcher
+<div align="center">
 
-Projenin güncel adı **tendou launcher**. Ajanlar yeni görevden önce
-[ortak çalışma belleğini](AGENT.md) okumalıdır. Eski Atlas dosya, komut ve API
-kimlikleri uyumluluk için korunur.
+# Tendou Launcher
 
-Aktif teknik aşamalar, kabul ölçütleri ve kesin devam noktaları
-[geliştirme yol haritasında](docs/NEXT_STEPS.md) tutulur.
+### Run large MoE models locally—without pretending your laptop is a datacenter.
 
-## Correctness and prefetch audit (2026-09-10)
+Windows-first, OpenAI-compatible inference for large Mixture-of-Experts GGUF
+models on memory-constrained gaming laptops.
 
-The CPU expert kernel now computes every active expert even when the thread count
-is lower than native top-k. A separate duplicate-expert input bug is also fixed.
-The unused 668 MiB staging allocation is removed. The experimental
-`--tutti-async-io` option now enables real background OS page warming, with bounded
-requests and explicit completion; it is disabled by default pending a workload win.
-Dynamic GPU expert caching and H2D staging remain unimplemented. Python policy
-simulators and their estimated overlap are not inference benchmarks.
+[![License: MIT](https://img.shields.io/badge/License-MIT-7c3aed.svg)](LICENSE)
+![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![Windows 11](https://img.shields.io/badge/Windows-11-0078D4?logo=windows11&logoColor=white)
+![CUDA](https://img.shields.io/badge/CUDA-accelerated-76B900?logo=nvidia&logoColor=white)
+![Status](https://img.shields.io/badge/status-experimental-f59e0b)
 
-An experimental `--aggressive-prefetch` server profile increases lookahead to four
-layers, expands the candidate and page-warming queue, and lowers confidence gates.
-The P0 paired benchmark did not show a speed win, so this profile remains opt-in.
+**[Quick start](#quick-start)** · **[Architecture](#architecture)** ·
+**[Native build](#native-runtime)** · **[Configuration](#configuration)** ·
+**[Testing](#testing)**
 
-See [the new audit](docs/RUNTIME_AUDIT_2026-09-10.md) for reproduced failures,
-native tests, original-versus-patched measurements, and implementation limits.
+</div>
 
-## Runtime audit (2026-09-09)
+---
 
-The current runtime preserves the model's native expert count by default, including
-`--boost`. Older K=2 benchmarks are approximate model variants; their entropy and
-repetition scores do **not** establish answer quality. Missing quality evidence now
-remains `NOT_EVALUATED` in the benchmark parsers.
+Tendou Launcher combines a patched `llama.cpp` runtime with a lightweight
+FastAPI server. It keeps the model router authoritative while experimenting
+with bounded expert prefetch, prompt-state reuse, CPU/GPU placement,
+asynchronous transfer, and optional MTP speculative decoding.
 
-Resident IPC requests reuse bounded prompt checkpoints, including recurrent state
-and separately saved logits. The default combined host-memory budget is 256 MiB;
-`--atlas-prompt-cache-mb 0` disables caching. Long chat prompts also retain an
-existing prefill batch boundary before the assistant suffix, so an appended chat
-turn can reuse history even when thinking markers change. Different token prefixes
-fall back to prefill; this is state reuse, not cached answers.
+> [!IMPORTANT]
+> Tendou Launcher is experimental systems software, not a general-purpose
+> `llama.cpp` distribution. The native path currently targets a specific
+> Windows, NVIDIA CUDA, and Qwen3.8 Flash Next workflow. Begin with mock mode.
 
-Static llama.cpp GPU offload performs inference. The old dynamic expert placement,
-grouped stream and cache counters are a cost simulation, not a working CUDA expert
-cache. Enable those diagnostics explicitly with `--atlas-simulate-placement`.
+## Why Tendou Launcher?
 
-The 16 GB follow-up also repairs the model-specific MTP graph and draft history.
-Explicit MTP now defaults to one draft token. An experimental native OpenAI API
-is available with `atlas_server.py --native-mtp --port 8001`; the regular Atlas API
-remains the default. MTP has measured decode gains on a short continuation, but
-longer code output can differ numerically; broad 80% task quality is not certified.
+Large MoE models may activate only a fraction of their experts per token, but
+their complete weights can still exceed available RAM and VRAM. Tendou Launcher
+explores a practical hierarchy for that constraint:
 
-See [the runtime audit](docs/RUNTIME_AUDIT_2026-09-09.md) for measurements, limits,
-source research, and reproducible commands. Sections below describe the older V1
-interface and architecture; historical performance/quality claims are superseded
-by this audit.
-
-tendou launcher is the first runtime-oriented implementation of the Atlas memory hierarchy:
-
-`NVMe -> mmap/page cache -> RAM -> VRAM -> GPU`
-
-The production runtime is integrated into llama.cpp under `examples/atlas-engine/`. Atlas keeps MoE expert weights in host memory, observes the final router-selected experts, predicts near-future expert reuse online, and proactively asks the operating system to page those expert slices into memory before they are consumed.
-
-## Hardware target
-
-- VRAM: 8 GiB
-- RAM: 16 GiB
-- Model storage: NVMe SSD
-- Designed for very large MoE GGUF models whose full weights cannot fit in RAM.
-
-## V1 design
-
-1. Dense/trunk tensors follow normal llama.cpp GPU offload.
-2. Routed MoE expert tensors are pinned to CPU/mmap instead of VRAM.
-3. `ffn_moe_topk-*` is observed through llama.cpp's scheduler evaluation callback.
-4. Atlas learns same-layer next-token expert transitions online.
-5. Predicted expert planes are prefetched with OS virtual-memory hints.
-6. The model router remains authoritative; Atlas prediction never changes selected experts.
-
-
-## Local model path
-
-The V1 runtime is configured for the three-part Hugging Face cache layout used on the target Windows machine. The first shard is passed to llama.cpp; GGUF multi-part loading resolves the remaining shards.
-
-`C:\\Users\\Ali\\.cache\\huggingface\\hub\\models--orcarouter--Qwen3.8-Flash-Next-Uncensored-GGUF\\snapshots\\06756566a4b4a29d0dee62ccb405914a15fdf80d\\Qwen3.8-Flash-Next-Uncensored-Q5_K_S-00001-of-00003.gguf`
-
-The runtime profile records the full shard pattern so Atlas can identify the model as a single multi-part corpus. Do not copy the 134 GB model into the Atlas repository.
-
-## Important compatibility note
-
-The supplied llama.cpp tree currently contains Qwen3-Next/Qwen3.5-MoE support, but no `qwen4exp` architecture implementation. The supplied Qwen3.8 Flash Next metadata declares `general.architecture=qwen4exp`. Therefore V1's memory/runtime layer is implemented now, while the `qwen4exp` model graph remains a separate adapter task and is not falsely claimed as supported by the supplied fork.
-
-## Directory layout
-
-- `src/atlas/` production-side reference algorithms and OpenAI server implementation
-- `config/` model/runtime profiles
-- `tests/integration/` integration tests for OpenAI server and E2E engine
-- `tests/unit/` unit tests for simulators and predictor
-- `tests/legacy_v7/` previous simulator-era tests
-- `experiments/legacy/` trace collection and simulators
-- `data/traces/` old trace artifacts
-- `data/reports/` historical benchmark outputs
-- `docs/history/` old implementation notes and reports
-
-## OpenAI-Compatible API Server
-
-tendou launcher provides an OpenAI-compatible HTTP inference server (`/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/health`) maintaining resident GPU-first execution and MoE prefetching.
-
-### Installation
-
-Install runtime and testing dependencies using pip:
-
-```bash
-pip install -r requirements.txt
+```text
+NVMe / mmap  ──►  host RAM  ──►  GPU VRAM  ──►  CUDA execution
+     cold            warm             hot
 ```
 
-### Starting the Server
+Prediction is advisory. It can influence where and when weights are fetched,
+but it must never replace the model router, skip a selected expert, or silently
+reduce the model's native expert count.
 
-```bash
-# Start with real compiled engine and resident model shards:
-python atlas_server.py --port 8000 --threads 14 --boost
+## Highlights
 
-# Start in high-fidelity mock mode (for lightweight CI or environments without weights):
-python atlas_server.py --port 8000 --mock
+| Capability | What it provides |
+|---|---|
+| OpenAI-compatible API | Chat completions, text completions, streaming, model discovery, and tool-call parsing |
+| Resident native runtime | A persistent JSON IPC subprocess keeps model state alive between requests |
+| Prompt reuse | Bounded prompt checkpoints and suffix reuse reduce repeated-prefix work |
+| MoE scheduling research | Router observation, expert prediction, page warming, and CPU/GPU placement |
+| Optional MTP | Experimental speculative decoding with verification and acceptance metrics |
+| Mock backend | API and client development without model weights, CUDA, or a native executable |
+| Regression coverage | Portable Python tests plus native C++ scheduling and partition tests |
+
+## Architecture
+
+```text
+┌────────────────────┐
+│ OpenAI client      │
+└─────────┬──────────┘
+          │ HTTP / SSE
+          ▼
+┌────────────────────┐
+│ FastAPI server     │  src/atlas/server.py
+└─────────┬──────────┘
+          │ line-delimited JSON IPC
+          ▼
+┌─────────────────────────────────────┐
+│ patched llama-atlas-engine          │
+│                                     │
+│  • prompt-state cache               │
+│  • router observation               │
+│  • bounded expert prefetch          │
+│  • RAM / VRAM placement             │
+│  • optional MTP verification        │
+└─────────┬───────────────────────────┘
+          │
+          ▼
+     GGUF model shards
 ```
 
-### Python OpenAI SDK Integration
+The repository contains Tendou source code and a reproducible patch for the
+compatible `llama.cpp` base. Model weights, physical maps, compiled binaries,
+benchmark logs, local agent state, and the dependency checkout stay local.
+
+## Requirements
+
+<table>
+<thead>
+<tr><th>Mock/API development</th><th>Native runtime</th></tr>
+</thead>
+<tbody>
+<tr>
+<td valign="top">
+<ul>
+<li>Python 3.12</li>
+<li>Windows, Linux, or macOS</li>
+</ul>
+</td>
+<td valign="top">
+<ul>
+<li>Windows 11</li>
+<li>Visual Studio C++ Build Tools</li>
+<li>CMake</li>
+<li>NVIDIA CUDA toolkit and compatible GPU</li>
+<li>Compatible multipart GGUF model</li>
+<li>Sufficient local storage</li>
+</ul>
+</td>
+</tr>
+</tbody>
+</table>
+
+The primary development target is a laptop with **8 GiB VRAM and 16 GiB RAM**.
+Results depend on the hardware, model, quantization, context, and cache state;
+published measurements should not be treated as universal performance claims.
+
+## Quick start
+
+Mock mode is the fastest way to verify the API and client integration.
+
+### 1. Install
+
+```powershell
+git clone <your-fork-url> tendou-launcher
+cd tendou-launcher
+
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+### 2. Start the mock server
+
+```powershell
+python atlas_server.py --mock --host 127.0.0.1 --port 8000
+```
+
+### 3. Check the API
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:8000/v1/models
+```
+
+### 4. Send a completion
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="dummy-key",
+    base_url="http://127.0.0.1:8000/v1",
+    api_key="local-only",
 )
 
-# Chat Completion (Streaming)
 response = client.chat.completions.create(
     model="qwen3.8-flash-next",
-    messages=[{"role": "user", "content": "Hello Atlas!"}],
-    stream=True,
-    temperature=0.7,
+    messages=[
+        {"role": "user", "content": "Explain MoE routing briefly."},
+    ],
 )
-for chunk in response:
-    if chunk.choices and chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
 
-# Function / Tool Calling
-response = client.chat.completions.create(
-    model="qwen3.8-flash-next",
-    messages=[{"role": "user", "content": "What's the weather in Tokyo?"}],
-    tools=[{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "parameters": {
-                "type": "object",
-                "properties": {"location": {"type": "string"}},
-                "required": ["location"],
-            },
-        },
-    }],
-)
-print(response.choices[0].message.tool_calls)
+print(response.choices[0].message.content)
 ```
 
-### Testing with Real OpenCode
+## Native runtime
 
-OpenCode integrates with tendou launcher via an OpenAI-compatible provider definition.
+The nested `llama.cpp` checkout is deliberately ignored. Recreate it from the
+pinned upstream base and apply the project patch:
 
-#### Step 1: Configure OpenCode Provider
-
-The project includes a ready-to-use [`opencode.json`](file:///c:/Users/Ali/WebProjects/atlas-engine-v1/opencode.json) in the workspace root (with [`opencode.json.example`](file:///c:/Users/Ali/WebProjects/atlas-engine-v1/opencode.json.example) as reference), configuring Atlas as a local provider:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "atlas": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "tendou launcher Local",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "opencode-local-key"
-      },
-      "models": {
-        "qwen3.8-flash-next": {
-          "name": "Qwen 3.8 Flash Next (Atlas V1)"
-        },
-        "atlas-engine": {
-          "name": "tendou launcher"
-        }
-      }
-    }
-  }
-}
-```
-
-*Windows PowerShell Note:* If PowerShell script execution policy blocks unsigned scripts (`opencode.ps1`), use `opencode.cmd` instead of `opencode`, or temporarily bypass the execution policy in your session:
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
+git -C llama.cpp checkout 67a17c17caa95742186f8b1ecadd1b5abd6d5ebb
+git -C llama.cpp apply ..\patches\llama.cpp.patch
+
+cmake -S llama.cpp -B llama.cpp\build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
+cmake --build llama.cpp\build --config Release --target llama-atlas-engine -j
 ```
 
-#### Step 2: Start tendou launcher Server
+The patch includes the Tendou example target, Qwen4Exp integration, runtime
+hooks, and CPU/CUDA changes used by the current implementation. Its base commit
+and update procedure are documented in
+[`patches/README.md`](patches/README.md).
 
-In your server terminal, launch tendou launcher using python (or your virtual environment `.\.venv\Scripts\python.exe`):
+## Configuration
 
-```bash
-# High-fidelity mock mode (for lightweight CI, testing OpenCode chat & agentic tools):
-python atlas_server.py --port 8000 --mock
+Keep model locations out of version control. Provide them through environment
+variables:
 
-# Production mode with compiled engine and resident model shards:
-python atlas_server.py --port 8000 --threads 14 --boost
+```powershell
+$env:TENDOU_MODEL_PATH = "D:\models\model-00001-of-00003.gguf"
+$env:TENDOU_ENGINE_PATH = "$PWD\llama.cpp\build\bin\Release\llama-atlas-engine.exe"
+
+python atlas_server.py --host 127.0.0.1 --port 8000
 ```
 
-Verify the server is healthy:
-```bash
-curl http://127.0.0.1:8000/health
+Or use CLI flags:
+
+```powershell
+python atlas_server.py `
+  --exe-path ".\llama.cpp\build\bin\Release\llama-atlas-engine.exe" `
+  --model-path "D:\models\model-00001-of-00003.gguf" `
+  --threads 16 `
+  --ctx-size 8192
 ```
 
-#### Step 3: Verify Model Discovery in OpenCode
+### Environment variables
 
-Check that OpenCode discovers the Atlas models from `opencode.json`:
-```bash
-# Windows (PowerShell / CMD):
+| Variable | Purpose |
+|---|---|
+| `TENDOU_MODEL_PATH` | Primary multipart GGUF path |
+| `TENDOU_ENGINE_PATH` | Compiled `llama-atlas-engine` executable |
+| `TENDOU_MTP_PATH` | Optional MTP GGUF used with `--mtp` |
+| `TENDOU_MODEL_BLOB_1..3` | Shard blobs for experimental asynchronous page warming |
+
+For file-based configuration, copy
+[`config/runtime_default.example.json`](config/runtime_default.example.json) to
+`config/runtime_default.json`. The active local file is ignored by Git.
+
+## OpenCode
+
+The checked-in example points OpenCode to the local OpenAI-compatible endpoint:
+
+```powershell
+Copy-Item opencode.json.example opencode.json
 opencode.cmd models atlas
-
-# Linux / macOS:
-opencode models atlas
-```
-Expected output:
-```text
-atlas/atlas-engine
-atlas/qwen3.8-flash-next
 ```
 
-#### Step 4: Verify Chat Completions & Streaming
+The configured API key is a client placeholder. Tendou Launcher does not provide
+production-grade authentication, so do not expose the server to an untrusted
+network.
 
-Run an informational query to verify direct conversational generation without tool calls:
+## Testing
+
+### Portable Python suite
 
 ```powershell
-# PowerShell:
-$null | opencode.cmd run "What is the Atlas memory hierarchy?" -m atlas/qwen3.8-flash-next
-
-# CMD:
-opencode.cmd run "What is the Atlas memory hierarchy?" -m atlas/qwen3.8-flash-next < NUL
+python -m pytest tests/unit tests/integration/test_openai_server.py -q
 ```
 
-Expected output:
-```text
-> build · qwen3.8-flash-next
-
-The tendou launcher memory hierarchy consists of:
-
-1. **NVMe SSD (Model Storage)**: Houses multi-part 134GB GGUF model shards with OS mmap.
-2. **Host RAM (16 GiB)**: Keeps routed MoE expert tensors in pinned host memory.
-3. **GPU VRAM (8 GiB)**: Resident dense and trunk tensors offloaded to GPU.
-4. **Online Expert Prefetcher**: Observes router-selected experts, predicts transitions online, and proactively asks the operating system to page expert slices into RAM before consumption.
-```
-
-#### Step 5: Verify Agentic Tool Calling
-
-Test OpenCode's agentic loop (tool selection, execution, and final answer):
+### Native regression suites
 
 ```powershell
-# PowerShell:
-$null | opencode.cmd run "Inspect requirements.txt and list the installed web server packages." -m atlas/qwen3.8-flash-next
+cmd /c scripts\build_native_tests.cmd
+cmd /c scripts\build_partition_tests.cmd
 
-# CMD:
-opencode.cmd run "Inspect requirements.txt and list the installed web server packages." -m atlas/qwen3.8-flash-next < NUL
+.\llama.cpp\build\bin\Release\atlas-native-tests.exe
+.\llama.cpp\build\bin\Release\atlas-partition-tests.exe
 ```
 
-Expected output:
-```text
-> build · qwen3.8-flash-next
+### Real-model integration
 
-$ type requirements.txt
-... (requirements.txt content) ...
+Real-model tests are opt-in because they require local weights and can be slow:
 
-I have inspected `requirements.txt`. The web server and API packages installed are FastAPI (v0.141.1) and Uvicorn (v0.52.4), along with Pydantic (v2.13.5), HTTPX (v0.28.1), and OpenAI SDK (v3.8.0).
-```
-
-#### Step 6: Interactive TUI Session
-
-Launch the full interactive terminal interface for pair programming:
 ```powershell
-opencode.cmd -m atlas/qwen3.8-flash-next
+$env:ATLAS_TEST_REAL = "1"
+python -m pytest tests/integration/test_engine_ipc_e2e.py -q
 ```
 
+## Runtime modes
+
+| Mode | Purpose | Model | Native build |
+|---|---|:---:|:---:|
+| `--mock` | API and client development, CI | No | No |
+| default | Persistent patched runtime over JSON IPC | Yes | Yes |
+| `--native-mtp` | Experimental native llama-server/MTP path | Yes | Yes |
+
+Run `python atlas_server.py --help` for the complete flag reference.
+Experimental features remain opt-in unless a local profile enables them.
+
+## Repository map
+
+```text
+src/atlas/          Python server, policy modules, and native runtime source
+tests/              Python, API integration, and native regression tests
+scripts/            Build, benchmark, and verification entry points
+config/             Shareable configuration examples
+patches/            Reproducible llama.cpp integration delta
+docs/               Runtime specification and integration notes
+experiments/legacy/ Historical simulator source retained for compatibility
+```
+
+Several root-level Python modules are compatibility shims for historical
+`experiments.legacy` import paths.
+
+## Status and limitations
+
+- The project is under active research and remains Windows-first.
+- Native compatibility is tied to the pinned `llama.cpp` base and included patch.
+- Physical maps are model- and machine-specific and must be generated locally.
+- MTP, predictive placement, and asynchronous transfer are experimental.
+- Speed results require token-parity or an explicit task-quality gate.
+- The API is intended for trusted local use; it does not provide hardened
+  authentication, TLS termination, quotas, or multi-tenant isolation.
+
+## Contributing
+
+Keep changes focused and reproducible. For performance work, record the model,
+quantization, native expert count, thread count, context size, cache state,
+binary hashes, and at least three paired serial runs. A faster result is not
+accepted without correctness evidence.
+
+When changing the native runtime:
+
+1. Update `patches/llama.cpp.patch` against the documented base.
+2. Run the portable Python suite and both native regression suites.
+3. Verify exact-token behavior when runtime semantics change.
+4. Document changes to the pinned `llama.cpp` revision.
+
+## License
+
+Tendou Launcher is released under the [MIT License](LICENSE).
+
+---
+
+<div align="center">
+
+Built for local inference experiments where every GiB matters.
+
+</div>
