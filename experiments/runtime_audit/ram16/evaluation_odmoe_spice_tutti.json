@@ -1,0 +1,58 @@
+{
+  "scope": "Three task smoke checks; not a general coding/reasoning quality certification",
+  "task_accuracy_pct": 100.0,
+  "exact_sequence_match_pct": 100.0,
+  "smoke_quality_gate_pass": true,
+  "general_quality_status": "NOT_EVALUATED",
+  "comparisons": [
+    {
+      "case": "math",
+      "repetition": 0,
+      "exact_tokens": true,
+      "task_pass": true,
+      "ttft_speedup": 0.9436101756060491,
+      "effective_speedup": 0.9162557723243966
+    },
+    {
+      "case": "math",
+      "repetition": 1,
+      "exact_tokens": true,
+      "task_pass": true,
+      "ttft_speedup": 257.37721059915606,
+      "effective_speedup": 37.11772672305701
+    },
+    {
+      "case": "code",
+      "repetition": 0,
+      "exact_tokens": true,
+      "task_pass": true,
+      "ttft_speedup": 0.8997681067913028,
+      "effective_speedup": 0.9569588288473866
+    },
+    {
+      "case": "code",
+      "repetition": 1,
+      "exact_tokens": true,
+      "task_pass": true,
+      "ttft_speedup": 296.78620350637476,
+      "effective_speedup": 23.180389994077675
+    },
+    {
+      "case": "logic",
+      "repetition": 0,
+      "exact_tokens": true,
+      "task_pass": true,
+      "ttft_speedup": 1.1352268173298294,
+      "effective_speedup": 1.1522153560719697
+    },
+    {
+      "case": "logic",
+      "repetition": 1,
+      "exact_tokens": true,
+      "task_pass": true,
+      "ttft_speedup": 392.91879609573886,
+      "effective_speedup": 61.66794158041286
+    }
+  ],
+  "median_effective_speedup": 12.166302675074823
+}

@@ -1,0 +1,159 @@
+{
+  "startup_s": 33.163366100000076,
+  "results": [
+    {
+      "case": "math",
+      "repetition": 0,
+      "ttft_ms": 17237.708299999897,
+      "elapsed_s": 22.19978859999992,
+      "effective_tps": 0.1351364219747575,
+      "decode_tps": 0.48683556469139,
+      "token_ids": [
+        18,
+        17,
+        18
+      ],
+      "text": "323",
+      "done": {
+        "completion_tokens": 4,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-57126f5f",
+        "prompt_tokens": 28,
+        "text": "323<|im_end|>"
+      }
+    },
+    {
+      "case": "math",
+      "repetition": 1,
+      "ttft_ms": 23816.879900000004,
+      "elapsed_s": 26.83625219999999,
+      "effective_tps": 0.11178908208352585,
+      "decode_tps": 0.9359678206775222,
+      "token_ids": [
+        18,
+        17,
+        18
+      ],
+      "text": "323",
+      "done": {
+        "completion_tokens": 4,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-a2de1253",
+        "prompt_tokens": 28,
+        "text": "323<|im_end|>"
+      }
+    },
+    {
+      "case": "code",
+      "repetition": 0,
+      "ttft_ms": 16200.533899999982,
+      "elapsed_s": 32.19004240000004,
+      "effective_tps": 0.4970481182093746,
+      "decode_tps": 0.9903100145694373,
+      "token_ids": [
+        760,
+        7258,
+        1510,
+        27379,
+        2477,
+        18,
+        11,
+        220,
+        16,
+        11,
+        220,
+        17,
+        2387,
+        63,
+        4523,
+        25
+      ],
+      "text": "The expression `sorted([3, 1, 2])` returns:",
+      "done": {
+        "completion_tokens": 16,
+        "event": "done",
+        "finish_reason": "length",
+        "id": "req-03fe2f4b",
+        "prompt_tokens": 28,
+        "text": "The expression `sorted([3, 1, 2])` returns:"
+      }
+    },
+    {
+      "case": "code",
+      "repetition": 1,
+      "ttft_ms": 14708.628099999942,
+      "elapsed_s": 40.54692299999988,
+      "effective_tps": 0.39460454249512467,
+      "decode_tps": 0.5996251551275275,
+      "token_ids": [
+        760,
+        7258,
+        1510,
+        27379,
+        2477,
+        18,
+        11,
+        220,
+        16,
+        11,
+        220,
+        17,
+        2387,
+        63,
+        4523,
+        25
+      ],
+      "text": "The expression `sorted([3, 1, 2])` returns:",
+      "done": {
+        "completion_tokens": 16,
+        "event": "done",
+        "finish_reason": "length",
+        "id": "req-61b7ee08",
+        "prompt_tokens": 28,
+        "text": "The expression `sorted([3, 1, 2])` returns:"
+      }
+    },
+    {
+      "case": "logic",
+      "repetition": 0,
+      "ttft_ms": 12469.000600000072,
+      "elapsed_s": 13.746092999999973,
+      "effective_tps": 0.0727479437248098,
+      "decode_tps": null,
+      "token_ids": [
+        9175
+      ],
+      "text": "Yes",
+      "done": {
+        "completion_tokens": 2,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-f7ceaff4",
+        "prompt_tokens": 34,
+        "text": "Yes<|im_end|>"
+      }
+    },
+    {
+      "case": "logic",
+      "repetition": 1,
+      "ttft_ms": 17894.74670000004,
+      "elapsed_s": 19.450988600000073,
+      "effective_tps": 0.05141126862826891,
+      "decode_tps": null,
+      "token_ids": [
+        9175
+      ],
+      "text": "Yes",
+      "done": {
+        "completion_tokens": 2,
+        "event": "done",
+        "finish_reason": "stop",
+        "id": "req-547aad5d",
+        "prompt_tokens": 34,
+        "text": "Yes<|im_end|>"
+      }
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-10-20T19:48:42Z",
+  "phase": "Phase 13: Real-Engine 20+ TPS & Incremental Tool Streaming M\u00fch\u00fcrleme",
+  "backend": "mock",
+  "model_path": "C:\\Users\\Ali\\WebProjects\\tendou-launcher\\models\\qwen3.8-gsq-rco-iq3_xxs\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "exe_path": "C:\\Users\\Ali\\WebProjects\\tendou-launcher\\llama.cpp\\build\\bin\\Release\\tendou-engine.exe",
+  "threads": 8,
+  "mtp_mode": "pld",
+  "vram_used_mib": 1351.79296875,
+  "all_passed": true,
+  "results": [
+    {
+      "workload": "repetitive-code-01",
+      "category": "code_template",
+      "tokens": 5,
+      "ttft_ms": 14.163399988319725,
+      "first_tool_arg_latency_ms": 0.0,
+      "decode_time_s": 0.06286140001611784,
+      "decode_tps": 63.632053994572004,
+      "vram_used_mib": 1357.66796875,
+      "vram_limit_ok": true,
+      "is_duplicate": false,
+      "passed": true
+    },
+    {
+      "workload": "creative-chat-01",
+      "category": "free_text",
+      "tokens": 32,
+      "ttft_ms": 15.302399988286197,
+      "first_tool_arg_latency_ms": 0.0,
+      "decode_time_s": 0.46748520000255667,
+      "decode_tps": 66.3122597246511,
+      "vram_used_mib": 1357.66796875,
+      "vram_limit_ok": true,
+      "is_duplicate": false,
+      "passed": true
+    },
+    {
+      "workload": "tool-call-edit-01",
+      "category": "tool_calling",
+      "tokens": 19,
+      "ttft_ms": 122.82670001150109,
+      "first_tool_arg_latency_ms": 15.237799991155043,
+      "decode_time_s": 0.18620589998317882,
+      "decode_tps": 96.66718402384701,
+      "vram_used_mib": 1351.79296875,
+      "vram_limit_ok": true,
+      "is_duplicate": false,
+      "passed": true
+    }
+  ]
+}

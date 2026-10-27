@@ -40,6 +40,9 @@ class BenchmarkItemResult:
     ttft_ms: float = 0.0
     decode_tps: float = 0.0
     effective_tps: float = 0.0
+    expert_page_bytes: int = 0
+    dram_read_bytes: Optional[int] = None
+    dram_counter_available: bool = False
     prefill_compute_ms: float = 0.0
     prefill_io_ms: float = 0.0
     gpu_compute_ms: float = 0.0

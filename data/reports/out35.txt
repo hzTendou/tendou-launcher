@@ -1,0 +1,136 @@
+[+] 12 sessiya yükləndi
+[+] Trace fazası: legacy decode-only
+[+] Records: all=1033 prompt=0 decode=0 unknown=1033
+
+========================================================================
+TEST 0 — TRACE VALIDATION / REQUEST BOUNDARIES
+========================================================================
+  session=  0 records=  74 prompt=   0 decode=   0 unknown=  74 prompt_idx=0
+  session=  1 records=  75 prompt=   0 decode=   0 unknown=  75 prompt_idx=1
+  session=  2 records=  74 prompt=   0 decode=   0 unknown=  74 prompt_idx=2
+  session=  3 records=  89 prompt=   0 decode=   0 unknown=  89 prompt_idx=3
+  session=  4 records=  74 prompt=   0 decode=   0 unknown=  74 prompt_idx=4
+  session=  5 records=  75 prompt=   0 decode=   0 unknown=  75 prompt_idx=5
+  session=  6 records=  99 prompt=   0 decode=   0 unknown=  99 prompt_idx=6
+  session=  7 records=  95 prompt=   0 decode=   0 unknown=  95 prompt_idx=7
+  session=  8 records= 109 prompt=   0 decode=   0 unknown= 109 prompt_idx=8
+  session=  9 records=  84 prompt=   0 decode=   0 unknown=  84 prompt_idx=9
+  session= 10 records=  95 prompt=   0 decode=   0 unknown=  95 prompt_idx=10
+  session= 11 records=  90 prompt=   0 decode=   0 unknown=  90 prompt_idx=11
+  Qeyd: bu trace köhnə formatdadır; session record-ları decode kimi istifadə olunur.
+
+========================================================================
+TEST 1 — LOCALITY ANALYSIS (SESSION-LOCAL)
+========================================================================
+Layer-to-layer overlap: 1.7%
+Token-to-token overlap: 32.9%
+  (min=8.9%, max=44.5%)
+Working-set: 239.3 expert/layer (min=228, max=256)
+Reuse distance: n=320987 median=2.0 P90=48.0 P95=95.0 P99=255.0 max=1010
+Cold-start MB/token:
+    orta=    11.1MB  P50=     1.2MB  P75=     9.6MB  P90=    31.2MB  P95=    50.4MB  P99=   124.6MB  max=   384.0MB
+
+========================================================================
+TEST 2 — SESSION-LOCAL LRU vs OLD CROSS-SESSION BASELINE
+========================================================================
+           Cache/layer |   Hit % |  orta MB/tok |  Req. GB/s |              Fits?
+--------------------------------------------------------------------------------
+                     8 |    34.6% |        251.1 |       4.91 |   BƏLİ (idealized)
+                    16 |    57.6% |        162.7 |       3.18 |   BƏLİ (idealized)
+                    32 |    70.5% |        113.4 |       2.21 |   BƏLİ (idealized)
+                    64 |    79.9% |         77.2 |       1.51 |   BƏLİ (idealized)
+                   128 |    83.9% |         61.7 |       1.20 |   BƏLİ (idealized)
+                   256 |    84.3% |         60.3 |       1.18 |   BƏLİ (idealized)
+  Session sərhədi hər request üçün cache-i sıfırlayır; unrelated prompts artıq bir-birinə cache miras vermir.
+
+========================================================================
+TEST 3 — PROMPT → DECODE SIGNAL
+========================================================================
+  Ölçülə bilmədi: trace-də explicit prompt-phase record yoxdur.
+  Yeni GGUF collector bu fazanı ayrıca yazacaq.
+
+========================================================================
+TEST 4 — EXPERT AFFINITY / REGION DISCOVERY
+========================================================================
+Affinity edges (count >= 2): 146619
+  layer= 37 E180  <-> E194   co-activation=547
+  layer= 38 E35   <-> E46    co-activation=546
+  layer= 37 E108  <-> E194   co-activation=546
+  layer= 36 E7    <-> E109   co-activation=544
+  layer= 34 E136  <-> E168   co-activation=542
+  layer= 37 E108  <-> E180   co-activation=539
+  layer= 37 E194  <-> E242   co-activation=534
+  layer= 37 E180  <-> E242   co-activation=534
+  layer= 33 E155  <-> E207   co-activation=534
+  layer= 32 E3    <-> E10    co-activation=534
+  layer= 37 E108  <-> E242   co-activation=530
+  layer= 35 E69   <-> E232   co-activation=528
+  layer= 34 E165  <-> E168   co-activation=527
+  layer= 34 E136  <-> E165   co-activation=525
+  layer= 36 E109  <-> E191   co-activation=523
+  layer= 36 E7    <-> E191   co-activation=523
+  layer= 38 E35   <-> E111   co-activation=522
+  layer= 38 E46   <-> E111   co-activation=516
+  layer= 36 E167  <-> E191   co-activation=515
+  layer= 36 E109  <-> E167   co-activation=512
+Discovered logical regions: 1969
+  R0000 layer=37 experts=[1, 4, 5, 6, 7, 8, 14, 219]
+  R0001 layer=37 experts=[3, 10, 12, 13, 18, 24, 25, 180]
+  R0002 layer=37 experts=[29, 33, 34, 35, 36, 38, 39, 242]
+  R0003 layer=37 experts=[16, 20, 22, 27, 31, 43, 48, 55]
+  R0004 layer=37 experts=[44, 53, 56, 62, 63, 65, 69, 194]
+  R0005 layer=37 experts=[64, 72, 73, 81, 85, 88, 92, 108]
+  R0006 layer=37 experts=[28, 37, 50, 52, 57, 58, 59, 121]
+  R0007 layer=37 experts=[15, 60, 78, 82, 84, 90, 91, 105]
+  R0008 layer=37 experts=[71, 101, 109, 110, 111, 115, 119, 120]
+  R0009 layer=37 experts=[87, 97, 102, 112, 116, 118, 126, 165]
+  Qeyd: bunlar semantic 'reasoning/coding' qrupları deyil; yalnız trace-dən çıxan co-activation region-larıdır.
+
+========================================================================
+TEST 5 — SAME-TOKEN NEXT-LAYER PREDICTABILITY
+========================================================================
+Next-layer prediction precision: 45.6%
+Next-layer prediction recall:    45.6%
+Observations: 40232
+
+========================================================================
+TEST 6 — PREFETCH SIMULATION: LRU vs ORACLE vs CAUSAL PREDICTOR
+========================================================================
+   Cache |  LRU hit |  Oracle hit |   Pred hit |   Pred P |   Pred R |   LRU MB/t |  Pred MB/t
+----------------------------------------------------------------------------------------------------
+       8 |    34.6% |       98.8% |      32.4% |    44.2% |    43.6% |       4.5 |     259.6
+      16 |    57.6% |       98.8% |      59.7% |    44.2% |    43.6% |       4.5 |     154.7
+      32 |    70.5% |       98.8% |      71.5% |    44.2% |    43.6% |       4.5 |     109.4
+      64 |    79.9% |       98.8% |      80.2% |    44.2% |    43.6% |       4.5 |      76.0
+     128 |    83.9% |       98.8% |      83.9% |    44.2% |    43.6% |       4.5 |      61.6
+     256 |    84.3% |       98.8% |      84.3% |    44.2% |    43.6% |       4.5 |      60.3
+  Oracle = növbəti token-un exact expert-lərini əvvəlcədən bilən nəzəri üst sərhəddir.
+  Predictor = yalnız əvvəlki routing-dən istifadə edir; gələcəyi görmür.
+
+========================================================================
+TEST 7 — MB/TOKEN TAILS
+========================================================================
+  LRU cache=8:
+    orta=   251.1MB  P50=   252.0MB  P75=   288.0MB  P90=   319.2MB  P95=   338.4MB  P99=   384.0MB  max=   384.0MB
+  LRU cache=16:
+    orta=   162.7MB  P50=   156.0MB  P75=   200.4MB  P90=   243.4MB  P95=   281.5MB  P99=   384.0MB  max=   384.0MB
+  LRU cache=32:
+    orta=   113.4MB  P50=   102.0MB  P75=   140.4MB  P90=   189.6MB  P95=   224.9MB  P99=   384.0MB  max=   384.0MB
+  LRU cache=64:
+    orta=    77.2MB  P50=    58.8MB  P75=    93.6MB  P90=   140.4MB  P95=   178.8MB  P99=   384.0MB  max=   384.0MB
+  LRU cache=128:
+    orta=    61.7MB  P50=    40.8MB  P75=    75.6MB  P90=   121.0MB  P95=   170.9MB  P99=   384.0MB  max=   384.0MB
+  LRU cache=256:
+    orta=    60.3MB  P50=    39.6MB  P75=    74.4MB  P90=   121.0MB  P95=   170.9MB  P99=   384.0MB  max=   384.0MB
+
+========================================================================
+XÜLASƏ / ATLAS QƏRAR METRİKLƏRİ
+========================================================================
+  1) LRU artıq session-lar arasında qarışdırılmır.
+  2) Prompt→decode yalnız explicit phase trace olduqda ölçülür.
+  3) Oracle ilə predictor arasında böyük boşluq varsa, prefetch üçün real optimizasiya sahəsi var.
+  4) Predictor precision/recall yüksəkdirsə, yanlış prefetch yalnız bandwidth/cache pollution maliyyətidir; router dəyişdirilmir.
+  5) Region discovery yalnız co-activation əsaslı storage/prefetch grouping-dir; semantic expert etiketi deyil.
+  6) Növbəti real mərhələ: bu statistikaları real NVMe/RAM/VRAM transfer simulator və sonra real runtime ilə təsdiqləməkdir.
+
+[+] JSON report: /mnt/data/atlas_work/report35.json

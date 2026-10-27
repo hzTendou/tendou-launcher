@@ -12,10 +12,16 @@ from scripts.benchmark_logger import (
     BenchmarkRunSummary,
     detect_hardware,
 )
-from scripts.run_continuous_benchmark import (
-    CONTEXT_CONFIGS,
-    build_suite_tasks,
-)
+try:
+    from tests.benchmarks.run_continuous_benchmark import (
+        CONTEXT_CONFIGS,
+        build_suite_tasks,
+    )
+except ImportError:
+    from scripts.run_continuous_benchmark import (
+        CONTEXT_CONFIGS,
+        build_suite_tasks,
+    )
 
 
 def test_hardware_detection():
@@ -298,7 +304,10 @@ def test_append_without_trailing_newline():
 
 def test_cli_parsing_and_context_aliases(monkeypatch):
     """Test parse_args with case variations, aliases, and custom paths."""
-    from scripts.run_continuous_benchmark import parse_args
+    try:
+        from tests.benchmarks.run_continuous_benchmark import parse_args
+    except ImportError:
+        from scripts.run_continuous_benchmark import parse_args
 
     monkeypatch.setattr("sys.argv", [
         "run_continuous_benchmark.py",

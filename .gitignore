@@ -1,12 +1,5 @@
-# Local agent state and private planning
-.context/
-AGENT.md
-AGENTS.md
-docs/NEXT_STEPS.md
-docs/agent-history.md
-
-# Local dependency checkouts
-llama.cpp/
+# Local dependency checkout (root only; release source snapshots are preserved)
+/llama.cpp/
 
 # Python environments and caches
 .venv/
@@ -26,56 +19,61 @@ config/qwen38_audit_report.json
 config/qwen38_model_profile.json
 config/trace_*.jsonl
 
-# Models, checkpoints, and generated experiment data
-*.gguf
-*.safetensors
-*.bin
-checkpoints/
-data/traces/
-data/reports/
-experiments/*
-!experiments/__init__.py
-!experiments/legacy/
-!experiments/legacy/**
-experiments/legacy/**/__pycache__/
-experiments/legacy/**/*.py[cod]
-
-# Local audit/history material
-docs/BENCHMARK_LOG.md
-docs/RUNTIME_AUDIT_*.md
-docs/history/
-
-# Machine-specific and one-off development helpers
-fix.py
-scripts/apply_engine_cpp.py
-scripts/update_engine.py
-scripts/inspect_model_full.py
-scripts/run_benchmarks.py
-scripts/run_gpu_first_benchmark.py
-scripts/run_grouped_gemm_benchmark.py
-scripts/run_speed_matrix.py
-scripts/benchmark_mtp.py
-scripts/benchmark_native_api.py
-scripts/build_cpu_kernel.cmd
-scripts/build_mtp_common.cmd
-scripts/build_mtp_graph.cmd
-scripts/build_native_http.cmd
-tests/unit/test_atlas_qwen38.py
-
-# Native build products and runtime logs
+# Local build artifacts, test binaries, temporary logs and backups
 build/
-*.dll
-*.exe
-*.lib
+tests/bin/
+backups/
 *.obj
 *.pdb
 *.rsp
 *.log
 engine_out.log
 engine_err.log
+err.txt
+out.txt
+test_out.txt
+
+# Binary files by default (except releases)
+*.dll
+*.exe
+*.lib
+
+# Sürümler (releases) - Tüm yayınlanmış kararlı sürümler ve ikili paketler dahil edilir
+!releases/
+!releases/**
 
 # Editor and OS files
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# -------------------------------------------------------------
+# STRICT EXCLUSIONS (Agent Private Memory & Model Weight Files)
+# Placed at bottom so no wildcard re-inclusion can override them.
+# -------------------------------------------------------------
+[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
+[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+**/[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
+**/[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+next_steps.md
+NEXT_STEPS.md
+**/next_steps.md
+**/NEXT_STEPS.md
+docs/NEXT_STEPS.md
+docs/agent-history.md
+**/agent-history.md
+.context/
+**/.context/
+
+# Models, weights, state caches and model-specific checkpoints (EXCLUDED)
+models/
+models/**
+**/models/**
+*.gguf
+*.safetensors
+*.bin
+*.state
+*.part*
+checkpoints/
+**/checkpoints/**

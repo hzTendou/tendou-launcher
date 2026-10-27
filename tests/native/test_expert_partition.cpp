@@ -70,7 +70,7 @@ static bool check(ggml_type type, int active, bool duplicate, bool broadcast = f
 
 int main() {
     bool ok = true;
-    for (auto type : {GGML_TYPE_F32, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4}) {
         ok = check(type, 10, false) && ok;
         ok = check(type, 10, false, true) && ok;
         ok = check(type, 1, false, true) && ok;

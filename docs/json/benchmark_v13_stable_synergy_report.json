@@ -1,0 +1,164 @@
+{
+  "timestamp": "2026-10-22T11:20:56Z",
+  "version": "0.13.0-stable",
+  "hardware": {
+    "has_gpu": true,
+    "gpu_name": "NVIDIA GeForce RTX 5060 Laptop GPU",
+    "vram_total_mb": 8151.0,
+    "vram_free_mb": 7172.21875,
+    "cpu_cores_physical": 8,
+    "cpu_cores_logical": 16,
+    "has_avx512_vnni": true,
+    "has_avx512_vbmi": true,
+    "has_avx2": true,
+    "ram_total_gb": 15.294158935546875,
+    "ram_avail_gb": 9.653812408447266,
+    "is_windows": true,
+    "directstorage_supported": true
+  },
+  "models": {
+    "qwen3.8-flash-next": {
+      "topology": {
+        "model_path": "C:\\Users\\Ali\\WebProjects\\tendou-launcher\\models\\qwen3.8-gsq-rco-iq3_xxs\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+        "model_name": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002",
+        "architecture": "qwen4exp",
+        "block_count": 48,
+        "expert_count": 512,
+        "expert_used_count": 10,
+        "intermediate_size": 512,
+        "file_size_gb": 43.81,
+        "quant_type": "IQ3_XXS",
+        "expert_slice_bytes": 1253376,
+        "is_moe": true
+      },
+      "configs": [
+        {
+          "config_name": "Config-A: Baseline (v0.11 Standard, PLD Off)",
+          "vram_used_mib": 6733.87890625,
+          "workload_results": [
+            {
+              "workload_id": "repetitive-code-01",
+              "category": "code_refactoring",
+              "tokens_generated": 11,
+              "cold_ttft_ms": 340.38,
+              "warm_ttft_ms": 181.08,
+              "ttft_ms": 181.08,
+              "cold_decode_tps": 10.97,
+              "warm_decode_tps": 26.7,
+              "decode_tps": 26.7,
+              "first_tool_arg_latency_ms": 0.0,
+              "total_elapsed_s": 0.595,
+              "output_text": "print('Element')\n    print('Done')",
+              "speculative_horizon": {
+                "mode": "off",
+                "draft_n": 2,
+                "rationale": "Static configuration mode (off)"
+              }
+            },
+            {
+              "workload_id": "greenfield-synthesis-01",
+              "category": "greenfield_reasoning",
+              "tokens_generated": 40,
+              "cold_ttft_ms": 3978.35,
+              "warm_ttft_ms": 2618.59,
+              "ttft_ms": 2618.59,
+              "cold_decode_tps": 16.87,
+              "warm_decode_tps": 20.79,
+              "decode_tps": 20.79,
+              "first_tool_arg_latency_ms": 0.0,
+              "total_elapsed_s": 4.495,
+              "output_text": "```rust\n// ============================================================================\n// Highly optimized, lock-free, single-producer/single-consumer (SPSC) ring buffer.\n// =========================",
+              "speculative_horizon": {
+                "mode": "off",
+                "draft_n": 2,
+                "rationale": "Static configuration mode (off)"
+              }
+            },
+            {
+              "workload_id": "tool-call-edit-01",
+              "category": "tool_calling_stream",
+              "tokens_generated": 48,
+              "cold_ttft_ms": 23006.9,
+              "warm_ttft_ms": 22148.85,
+              "ttft_ms": 22148.85,
+              "cold_decode_tps": 23.33,
+              "warm_decode_tps": 24.29,
+              "decode_tps": 24.29,
+              "first_tool_arg_latency_ms": 54.56,
+              "total_elapsed_s": 24.085,
+              "output_text": "",
+              "speculative_horizon": {
+                "mode": "off",
+                "draft_n": 2,
+                "rationale": "Static configuration mode (off)"
+              }
+            }
+          ]
+        },
+        {
+          "config_name": "Config-D: Tendou v0.13.0-stable + Tening Auto-Tuned (Adaptive Dynamic Horizon)",
+          "vram_used_mib": 6709.41015625,
+          "workload_results": [
+            {
+              "workload_id": "repetitive-code-01",
+              "category": "code_refactoring",
+              "tokens_generated": 11,
+              "cold_ttft_ms": 368.45,
+              "warm_ttft_ms": 196.29,
+              "ttft_ms": 196.29,
+              "cold_decode_tps": 11.09,
+              "warm_decode_tps": 25.86,
+              "decode_tps": 25.86,
+              "first_tool_arg_latency_ms": 0.0,
+              "total_elapsed_s": 0.624,
+              "output_text": "print('Element')\n    print('Done')",
+              "speculative_horizon": {
+                "mode": "pld",
+                "draft_n": 3,
+                "rationale": "Workload category 'code_refactoring' has verified high acceptance (alpha >= 0.70) -> PLD d*=3 active"
+              }
+            },
+            {
+              "workload_id": "greenfield-synthesis-01",
+              "category": "greenfield_reasoning",
+              "tokens_generated": 40,
+              "cold_ttft_ms": 3964.58,
+              "warm_ttft_ms": 2571.22,
+              "ttft_ms": 2571.22,
+              "cold_decode_tps": 16.92,
+              "warm_decode_tps": 20.75,
+              "decode_tps": 20.75,
+              "first_tool_arg_latency_ms": 0.0,
+              "total_elapsed_s": 4.451,
+              "output_text": "```rust\n// ============================================================================\n1.  // Highly optimized, lock-free, single-producer/single-consumer (SPSC) ring buffer.\n2.  //\n3.  //",
+              "speculative_horizon": {
+                "mode": "off",
+                "draft_n": 0,
+                "rationale": "Workload category 'greenfield_reasoning' is non-repetitive (alpha ~ 0) -> Zero-penalty fallback d*=0 active"
+              }
+            },
+            {
+              "workload_id": "tool-call-edit-01",
+              "category": "tool_calling_stream",
+              "tokens_generated": 48,
+              "cold_ttft_ms": 21835.78,
+              "warm_ttft_ms": 22395.65,
+              "ttft_ms": 22395.65,
+              "cold_decode_tps": 23.97,
+              "warm_decode_tps": 24.09,
+              "decode_tps": 24.09,
+              "first_tool_arg_latency_ms": 59.33,
+              "total_elapsed_s": 24.348,
+              "output_text": "",
+              "speculative_horizon": {
+                "mode": "off",
+                "draft_n": 0,
+                "rationale": "Tool calling stream requires immediate first-argument emission; adaptive fallback d*=0 enforced"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
