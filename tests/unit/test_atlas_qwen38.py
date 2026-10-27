@@ -10,12 +10,15 @@ class TestAtlasQwen38(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         map_file = CONFIG_DIR / "atlas_physical_map_qwen38.json"
-        assert map_file.exists(), f"Physical map file not found: {map_file}"
+        report_file = CONFIG_DIR / "qwen38_audit_report.json"
+        if not map_file.exists() or not report_file.exists():
+            raise unittest.SkipTest(
+                f"Physical map ({map_file.name}) or audit report ({report_file.name}) not found. "
+                "These calibration files are generated locally and excluded from version control."
+            )
         with open(map_file, "r", encoding="utf-8") as f:
             cls.physical_map = json.load(f)
 
-        report_file = CONFIG_DIR / "qwen38_audit_report.json"
-        assert report_file.exists(), f"Audit report not found: {report_file}"
         with open(report_file, "r", encoding="utf-8") as f:
             cls.audit_report = json.load(f)
 
