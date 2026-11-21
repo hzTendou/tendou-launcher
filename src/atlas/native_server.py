@@ -14,8 +14,13 @@ def make_launch(args):
         raise ValueError("Native server executable or model GGUF is missing")
     env = os.environ.copy()
     env["ATLAS_HTTP_CLOSE"] = "1"
-    cuda = Path(sysconfig.get_path("purelib")) / "nvidia/cu13/bin/x86_64"
-    env["PATH"] = str(cuda) + os.pathsep + env.get("PATH", "")
+    if os.name == "nt":
+        cuda = Path(sysconfig.get_path("purelib")) / "nvidia/cu13/bin/x86_64"
+        env["PATH"] = str(cuda) + os.pathsep + env.get("PATH", "")
+    else:
+        ld_dirs = [str(executable.parent), "/usr/local/cuda-13.2/lib64", "/usr/local/cuda/lib64"]
+        cur_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(ld_dirs) + (os.pathsep + cur_ld if cur_ld else "")
     layers = "|".join(str(i) for i in range(2, 48))
     placement = rf"blk\.({layers})\.ffn_(up|down|gate_up|gate)_exps=CPU"
     command = [str(executable), "-m", args.model_path, "--alias", DEFAULT_MODEL_ID,
@@ -41,7 +46,8 @@ def make_launch(args):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--exe-path", default=str(Path(DEFAULT_EXE_PATH).with_name("llama-server.exe")))
+    server_bin = "llama-server.exe" if os.name == "nt" else "llama-server"
+    p.add_argument("--exe-path", default=str(Path(DEFAULT_EXE_PATH).with_name(server_bin)))
     p.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     p.add_argument("--mtp-path")
     p.add_argument("--mtp", choices=["off", "ram", "dense-gpu"], default="ram")

@@ -12,6 +12,8 @@
 #include "ggml-cuda.h"
 #endif
 
+const std::vector<std::pair<std::string, struct ggml_tensor *>> & llama_internal_get_tensor_map(const struct llama_model * model);
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -50,20 +52,40 @@ static inline std::string json_dump_safe(const nlohmann::json & j) {
     }
 }
 
+static std::mutex g_ipc_stdout_mtx;
+static std::atomic<int> g_ipc_phase{0}; // 0=idle, 1=prefill, 2=decode
+static std::atomic<int> g_ipc_prefill_pos{0};
+static std::atomic<int> g_ipc_prefill_total{0};
+static std::atomic<int> g_ipc_generated{0};
+
+static inline void ipc_emit(const nlohmann::json & j) {
+    const std::string line = json_dump_safe(j) + "\n";
+    std::lock_guard<std::mutex> lk(g_ipc_stdout_mtx);
+    std::fwrite(line.data(), 1, line.size(), stdout);
+    std::fflush(stdout);
+}
+
+static bool atlas_llama_abort_callback(void * data) {
+    const auto * flag = static_cast<const std::atomic<bool> *>(data);
+    return flag != nullptr && flag->load(std::memory_order_relaxed);
+}
+
 #if defined(_WIN32)
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0602
 #endif
 #define NOMINMAX
 #include <windows.h>
+extern "C" __declspec(dllimport) void atlas_set_expert_gpu_slot(int layer, int expert, int16_t slot);
 #else
+#include <dlfcn.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+extern "C" void atlas_set_expert_gpu_slot(int layer, int expert, int16_t slot);
 #endif
-
-extern "C" __declspec(dllimport) void atlas_set_expert_gpu_slot(int layer, int expert, int16_t slot);
 
 namespace atlas {
 
@@ -72,10 +94,48 @@ static inline double elapsed_ms(clock::time_point start, clock::time_point end) 
 }
 
 static inline int get_blob_idx(const std::string & bp) {
-    if (bp.find("98c00111") != std::string::npos) return 0;
-    if (bp.find("d43111ec") != std::string::npos) return 1;
-    if (bp.find("1cf59e7a") != std::string::npos) return 2;
+    if (bp.find("98c00111") != std::string::npos || bp.find("-00001-of-") != std::string::npos) return 0;
+    if (bp.find("d43111ec") != std::string::npos || bp.find("-00002-of-") != std::string::npos) return 1;
+    if (bp.find("1cf59e7a") != std::string::npos || bp.find("-00003-of-") != std::string::npos) return 2;
+    if (bp.find(".gguf") != std::string::npos) return 0;
     return -1;
+}
+
+static inline std::string normalize_blob_path(const std::string & raw_bp) {
+    std::string out;
+    out.reserve(raw_bp.size());
+    for (size_t i = 0; i < raw_bp.size(); ++i) {
+        if (raw_bp[i] == '\\' && i + 1 < raw_bp.size() && raw_bp[i+1] == '\\') {
+#if defined(_WIN32)
+            out += '\\';
+#else
+            out += '/';
+#endif
+            ++i;
+        } else if (raw_bp[i] == '\\') {
+#if defined(_WIN32)
+            out += '\\';
+#else
+            out += '/';
+#endif
+        } else {
+            out += raw_bp[i];
+        }
+    }
+#if !defined(_WIN32)
+    const std::string win_proj = "C:/Users/Ali/WebProjects/tendou-launcher/";
+    const std::string lin_proj = "/mnt/Ortak/WebProjects/tendou-launcher/";
+    if (out.rfind(win_proj, 0) == 0) {
+        out.replace(0, win_proj.size(), lin_proj);
+    } else {
+        const std::string win_hf = "C:/Users/Ali/.cache/huggingface/hub/";
+        const std::string lin_hf = "/mnt/Ortak/huggingface/hub/";
+        if (out.rfind(win_hf, 0) == 0) {
+            out.replace(0, win_hf.size(), lin_hf);
+        }
+    }
+#endif
+    return out;
 }
 
 static std::string json_str_val(const std::string & line, const std::string & key) {
@@ -176,15 +236,7 @@ static bool parse_json_map(const std::string & path,
                         cur_chunk.blob_path = s_last_clean_bp;
                         cur_chunk.blob_idx = s_last_blob_idx;
                     } else {
-                        cur_chunk.blob_path.clear();
-                        for (size_t i = 0; i < bp.size(); ++i) {
-                            if (bp[i] == '\\' && i + 1 < bp.size() && bp[i+1] == '\\') {
-                                cur_chunk.blob_path += '\\';
-                                ++i;
-                            } else {
-                                cur_chunk.blob_path += bp[i];
-                            }
-                        }
+                        cur_chunk.blob_path = normalize_blob_path(bp);
                         cur_chunk.blob_idx = get_blob_idx(cur_chunk.blob_path);
                         s_last_raw_bp = bp;
                         s_last_clean_bp = cur_chunk.blob_path;
@@ -226,8 +278,8 @@ static bool parse_json_map(const std::string & path,
 // ---------------------------------------------------------------------------
 class PagePrefetcher {
 public:
-    PagePrefetcher() : running_(true) {
-        init_mappings();
+    explicit PagePrefetcher(const ExpertMemoryManager * mm = nullptr) : running_(true) {
+        init_mappings(mm);
         worker_ = std::thread(&PagePrefetcher::worker_fn, this);
     }
 
@@ -266,21 +318,55 @@ private:
     };
     MmapEntry blobs_[3];
 
-    void init_mappings() {
+    void init_mappings(const ExpertMemoryManager * mm) {
         static const char * BLOB_ENV_VARS[3] = {
             "TENDOU_MODEL_BLOB_1",
             "TENDOU_MODEL_BLOB_2",
             "TENDOU_MODEL_BLOB_3",
         };
+        std::string fallback_paths[3];
+        if (mm) {
+            for (int l = 0; l < 48; ++l) {
+                const PhysicalExpert * pe = mm->get_expert_info(l, 0);
+                if (!pe) continue;
+                for (const auto & ch : pe->chunks) {
+                    if (ch.blob_idx >= 0 && ch.blob_idx < 3 && fallback_paths[ch.blob_idx].empty() && !ch.blob_path.empty()) {
+                        fallback_paths[ch.blob_idx] = ch.blob_path;
+                    }
+                }
+            }
+        }
+        const char * mfile = std::getenv("TENDOU_MODEL_FILE");
+        if (!mfile) mfile = std::getenv("ATLAS_MODEL_FILE");
+        if (mfile && mfile[0]) {
+            if (fallback_paths[0].empty()) fallback_paths[0] = mfile;
+            std::string p0 = mfile;
+            for (int b = 1; b < 3; ++b) {
+                if (fallback_paths[b].empty()) {
+                    char needle[32], repl[32];
+                    std::snprintf(needle, sizeof(needle), "-%05d-of-", 1);
+                    std::snprintf(repl, sizeof(repl), "-%05d-of-", b + 1);
+                    size_t pos = p0.find(needle);
+                    if (pos != std::string::npos) {
+                        std::string derived = p0;
+                        derived.replace(pos, std::strlen(needle), repl);
+                        fallback_paths[b] = derived;
+                    }
+                }
+            }
+        }
         for (int i = 0; i < 3; ++i) {
-            const char * blob_path = std::getenv(BLOB_ENV_VARS[i]);
-            if (!blob_path || !blob_path[0]) continue;
+            const char * env_path = std::getenv(BLOB_ENV_VARS[i]);
+            std::string bp_norm = (env_path && env_path[0]) ? normalize_blob_path(env_path) :
+                                  (!fallback_paths[i].empty() ? normalize_blob_path(fallback_paths[i]) : "");
+            if (bp_norm.empty()) continue;
+            const char * blob_path = bp_norm.c_str();
 #if defined(_WIN32)
             blobs_[i].hFile = CreateFileA(blob_path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                                           OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, nullptr);
             if (blobs_[i].hFile != INVALID_HANDLE_VALUE) {
                 LARGE_INTEGER sz{};
-                if (GetFileSizeEx(blobs_[i].hFile, &sz)) {
+                if (GetFileSizeEx(blobs_[i].hFile, &sz) && sz.QuadPart > 0) {
                     blobs_[i].file_size = (size_t)sz.QuadPart;
                     blobs_[i].hMap = CreateFileMappingA(blobs_[i].hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
                     if (blobs_[i].hMap) {
@@ -291,10 +377,17 @@ private:
 #else
             int fd = open(blob_path, O_RDONLY);
             if (fd >= 0) {
-                struct stat st;
-                if (fstat(fd, &st) == 0) {
-                    blobs_[i].file_size = st.st_size;
-                    blobs_[i].base = mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+                struct stat st{};
+                if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                    blobs_[i].file_size = (size_t)st.st_size;
+                    blobs_[i].base = mmap(nullptr, blobs_[i].file_size, PROT_READ, MAP_SHARED, fd, 0);
+                    if (blobs_[i].base == MAP_FAILED) {
+                        blobs_[i].base = nullptr;
+                    } else {
+#if defined(__linux__)
+                        madvise(blobs_[i].base, blobs_[i].file_size, MADV_HUGEPAGE);
+#endif
+                    }
                 }
                 close(fd);
             }
@@ -352,8 +445,9 @@ private:
                 if (r.blob_idx < 0 || r.blob_idx >= 3) continue;
                 MmapEntry & me = blobs_[r.blob_idx];
                 if (!me.base || r.file_offset + r.size_bytes > me.file_size) continue;
-                void * ptr = static_cast<uint8_t *>(me.base) + r.file_offset;
-                madvise(ptr, r.size_bytes, MADV_WILLNEED);
+                uint8_t * ptr = static_cast<uint8_t *>(me.base) + r.file_offset;
+                const size_t prefix = r.file_offset & 4095;
+                madvise(ptr - prefix, r.size_bytes + prefix, MADV_WILLNEED);
                 pages_warmed++;
             }
 #endif
@@ -395,17 +489,27 @@ void PredictivePrefetchScheduler::execute_consensus_prefetch(
 // Tutti-inspired asynchronous OS page warming (no staging or dynamic H2D)
 // ---------------------------------------------------------------------------
 TuttiAsyncPipeline::TuttiAsyncPipeline(const Config & cfg, PinnedHostStagingPool &)
-    : cfg_(cfg) { worker_ = std::thread(&TuttiAsyncPipeline::worker_fn, this); }
+    : cfg_(cfg) {
+    const int n_workers = std::max(1, std::min(8, cfg_.tutti_threads));
+    workers_.reserve(size_t(n_workers));
+    for (int w = 0; w < n_workers; ++w) {
+        workers_.emplace_back(&TuttiAsyncPipeline::worker_fn, this);
+    }
+}
 
 TuttiAsyncPipeline::~TuttiAsyncPipeline() {
     clear();
     { std::lock_guard<std::mutex> lk(q_mtx_); running_ = false; }
     q_cv_.notify_all();
-    if (worker_.joinable()) worker_.join();
+    for (auto & t : workers_) {
+        if (t.joinable()) t.join();
+    }
+    workers_.clear();
     close_all_handles();
 }
 
 TuttiAsyncPipeline::MmapBlob * TuttiAsyncPipeline::mapping_for(const std::string & path) {
+    std::lock_guard<std::mutex> blk(blobs_mtx_);
     auto found = blobs_.find(path);
     if (found != blobs_.end()) return &found->second;
     if (blobs_.size() >= 64) return nullptr;
@@ -428,7 +532,13 @@ TuttiAsyncPipeline::MmapBlob * TuttiAsyncPipeline::mapping_for(const std::string
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
             mb.file_size = size_t(st.st_size);
             mb.base = mmap(nullptr, mb.file_size, PROT_READ, MAP_SHARED, fd, 0);
-            if (mb.base == MAP_FAILED) mb.base = nullptr;
+            if (mb.base == MAP_FAILED) {
+                mb.base = nullptr;
+            } else {
+#if defined(__linux__)
+                madvise(mb.base, mb.file_size, MADV_HUGEPAGE);
+#endif
+            }
         }
         close(fd);
     }
@@ -662,7 +772,7 @@ ExpertMemoryManager::ExpertMemoryManager(const Config & c) : cfg(c) {
 ExpertMemoryManager::~ExpertMemoryManager() {}
 
 bool ExpertMemoryManager::load_physical_map(const std::string & path) {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     std::string candidate_path = path;
     if (!std::ifstream(candidate_path).good()) {
         if (std::ifstream("../" + path).good()) {
@@ -679,7 +789,9 @@ bool ExpertMemoryManager::load_physical_map(const std::string & path) {
             if (idx < TOTAL_EXPERTS) {
                 PhysicalExpert pe_copy = pe;
                 expert_flat[idx] = pe_copy;
-                residency_flat[idx] = MemoryTier::NVME;
+                if (k.layer >= cfg.gpu_expert_layers && !vram_present_flat[idx] && !ram_present_flat[idx]) {
+                    residency_flat[idx] = MemoryTier::NVME;
+                }
             }
         }
         return true;
@@ -718,7 +830,7 @@ void ExpertMemoryManager::unpin_all(TokenTimeline * cur_tl) {
 }
 
 void ExpertMemoryManager::flush_vram() {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     for (const auto & k : vram_lru) {
         size_t idx = size_t(k.layer) * 512 + size_t(k.expert);
         if (idx < TOTAL_EXPERTS && residency_flat[idx] == MemoryTier::VRAM) {
@@ -730,7 +842,7 @@ void ExpertMemoryManager::flush_vram() {
 }
 
 void ExpertMemoryManager::flush_all() {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     vram_lru.clear(); vram_used_bytes = 0;
     ram_lru.clear();  ram_used_bytes  = 0;
     std::fill(vram_present_flat.begin(), vram_present_flat.end(), 0);
@@ -753,6 +865,10 @@ bool ExpertMemoryManager::evict_vram_one_unlocked(TokenTimeline * cur_tl) {
         --it;
         size_t v_idx = size_t(it->layer) * 512 + size_t(it->expert);
         if (v_idx < TOTAL_EXPERTS) {
+            if (!vram_present_flat[v_idx]) {
+                vram_lru.erase(it);
+                return true;
+            }
             if (it->layer < cfg.gpu_expert_layers) continue; // GPU anchors never evicted
             if (pinned_flat[v_idx]) continue;               // Pinned experts protected
             if (hotness_flat[v_idx] > 0) {
@@ -771,6 +887,10 @@ bool ExpertMemoryManager::evict_vram_one_unlocked(TokenTimeline * cur_tl) {
         --it;
         size_t v_idx = size_t(it->layer) * 512 + size_t(it->expert);
         if (v_idx < TOTAL_EXPERTS) {
+            if (!vram_present_flat[v_idx]) {
+                vram_lru.erase(it);
+                return true;
+            }
             if (it->layer < cfg.gpu_expert_layers) continue;
             if (pinned_flat[v_idx]) continue;
         }
@@ -792,6 +912,10 @@ bool ExpertMemoryManager::evict_ram_one_unlocked(TokenTimeline * cur_tl) {
         --it;
         size_t v_idx = size_t(it->layer) * 512 + size_t(it->expert);
         if (v_idx < TOTAL_EXPERTS) {
+            if (!ram_present_flat[v_idx]) {
+                ram_lru.erase(it);
+                return true;
+            }
             if (pinned_flat[v_idx]) continue;
             if (vram_present_flat[v_idx]) continue; // Never evict an expert active in VRAM!
             if (hotness_flat[v_idx] > 0) {
@@ -810,6 +934,10 @@ bool ExpertMemoryManager::evict_ram_one_unlocked(TokenTimeline * cur_tl) {
         --it;
         size_t v_idx = size_t(it->layer) * 512 + size_t(it->expert);
         if (v_idx < TOTAL_EXPERTS) {
+            if (!ram_present_flat[v_idx]) {
+                ram_lru.erase(it);
+                return true;
+            }
             if (pinned_flat[v_idx]) continue;
             if (vram_present_flat[v_idx]) continue;
         }
@@ -832,18 +960,20 @@ bool ExpertMemoryManager::promote_expert_unlocked(int layer, int expert, MemoryT
     MemoryTier current = (layer < cfg.gpu_expert_layers) ? MemoryTier::VRAM : residency_flat[idx];
 
     if (target_tier == MemoryTier::VRAM) {
-        if (current == MemoryTier::VRAM) {
+        if (current == MemoryTier::VRAM || vram_present_flat[idx]) {
             if (layer >= cfg.gpu_expert_layers && vram_present_flat[idx]) {
                 vram_lru.erase(vram_iter_flat[idx]);
                 vram_lru.push_front(key);
                 vram_iter_flat[idx] = vram_lru.begin();
             }
+            residency_flat[idx] = MemoryTier::VRAM;
+            residency[key] = MemoryTier::VRAM;
             hotness_flat[idx] = std::min<uint8_t>(hotness_flat[idx] + 1, 15);
             return true;
         }
 
         // If currently in RAM, release RAM slot and remove from ram_lru to avoid double-allocation
-        if (current == MemoryTier::RAM) {
+        if (current == MemoryTier::RAM || ram_present_flat[idx] || ram_slot_flat[idx] >= 0) {
             int r_slot = ram_slot_flat[idx];
             if (r_slot >= 0) {
                 ram_slab_pool.release_slot(r_slot);
@@ -856,9 +986,15 @@ bool ExpertMemoryManager::promote_expert_unlocked(int layer, int expert, MemoryT
             ram_used_bytes = (ram_used_bytes > sz) ? (ram_used_bytes - sz) : 0;
         }
 
-        // Evict from VRAM if capacity is reached
+        // Zero-OOM Elastic Watermark: proactively evict slabs if KV headroom or capacity is pressured
+        enforce_kv_watermark(sz, cur_tl);
+
+        // Evict from VRAM if capacity is reached (with forward-progress guard)
         while (vram_slab_pool.free_slots() == 0 && !vram_lru.empty()) {
+            const size_t prev_lru = vram_lru.size();
+            const size_t prev_free = vram_slab_pool.free_slots();
             if (!evict_vram_one_unlocked(cur_tl)) break;
+            if (vram_lru.size() == prev_lru && vram_slab_pool.free_slots() == prev_free) break;
         }
 
         int v_slot = vram_slab_pool.acquire_slot();
@@ -879,17 +1015,18 @@ bool ExpertMemoryManager::promote_expert_unlocked(int layer, int expert, MemoryT
             }
             metrics.dynamic_migrations_total++;
 
-            // Sync with GPU slot lookup
-            atlas_set_expert_gpu_slot(layer, expert, (v_slot < 21) ? (int16_t)v_slot : (int16_t)(v_slot % 21));
+            // Dynamic migration recorded
             return true;
         }
         return false;
     } else if (target_tier == MemoryTier::RAM) {
-        if (current == MemoryTier::VRAM || current == MemoryTier::RAM) {
-            if (current == MemoryTier::RAM && ram_present_flat[idx]) {
+        if (current == MemoryTier::VRAM || current == MemoryTier::RAM || ram_present_flat[idx]) {
+            if (ram_present_flat[idx]) {
                 ram_lru.erase(ram_iter_flat[idx]);
                 ram_lru.push_front(key);
                 ram_iter_flat[idx] = ram_lru.begin();
+                residency_flat[idx] = MemoryTier::RAM;
+                residency[key] = MemoryTier::RAM;
             }
             hotness_flat[idx] = std::min<uint8_t>(hotness_flat[idx] + 1, 15);
             return true;
@@ -897,7 +1034,10 @@ bool ExpertMemoryManager::promote_expert_unlocked(int layer, int expert, MemoryT
 
         // NVMe to RAM promotion: evict coldest RAM expert down to NVMe if full
         while (ram_slab_pool.free_slots() == 0 && !ram_lru.empty()) {
+            const size_t prev_lru = ram_lru.size();
+            const size_t prev_free = ram_slab_pool.free_slots();
             if (!evict_ram_one_unlocked(cur_tl)) break;
+            if (ram_lru.size() == prev_lru && ram_slab_pool.free_slots() == prev_free) break;
         }
 
         int r_slot = ram_slab_pool.acquire_slot();
@@ -931,23 +1071,33 @@ bool ExpertMemoryManager::demote_vram_to_ram_unlocked(int layer, int expert, Tok
     if (vram_present_flat[idx]) {
         vram_lru.erase(vram_iter_flat[idx]);
         vram_present_flat[idx] = 0;
+        vram_used_bytes = (vram_used_bytes > sz) ? (vram_used_bytes - sz) : 0;
     }
     int v_slot = vram_slot_flat[idx];
     if (v_slot >= 0) {
         vram_slab_pool.release_slot(v_slot);
         vram_slot_flat[idx] = -1;
     }
-    vram_used_bytes = (vram_used_bytes > sz) ? (vram_used_bytes - sz) : 0;
     metrics.vram_evictions++;
     metrics.tier0_to_tier1_demotions++;
     metrics.dynamic_migrations_total++;
 
-    // Sync GPU slot lookup: expert is no longer in GPU VRAM
-    atlas_set_expert_gpu_slot(layer, expert, -1);
+    // Idempotency guard: if already in RAM, refresh LRU and never double-allocate or duplicate LRU nodes
+    if (ram_present_flat[idx]) {
+        ram_lru.erase(ram_iter_flat[idx]);
+        ram_lru.push_front(key);
+        ram_iter_flat[idx] = ram_lru.begin();
+        residency_flat[idx] = MemoryTier::RAM;
+        residency[key] = MemoryTier::RAM;
+        return true;
+    }
 
-    // Demote into RAM slab pool (cascading coldest RAM expert to NVMe if full)
+    // Demote into RAM slab pool (cascading coldest RAM expert to NVMe if full, with progress guard)
     while (ram_slab_pool.free_slots() == 0 && !ram_lru.empty()) {
+        const size_t prev_lru = ram_lru.size();
+        const size_t prev_free = ram_slab_pool.free_slots();
         if (!evict_ram_one_unlocked(cur_tl)) break;
+        if (ram_lru.size() == prev_lru && ram_slab_pool.free_slots() == prev_free) break;
     }
 
     int r_slot = ram_slab_pool.acquire_slot();
@@ -957,10 +1107,14 @@ bool ExpertMemoryManager::demote_vram_to_ram_unlocked(int layer, int expert, Tok
         ram_iter_flat[idx] = ram_lru.begin();
         ram_present_flat[idx] = 1;
         ram_used_bytes += sz;
+        residency_flat[idx] = MemoryTier::RAM;
+        residency[key] = MemoryTier::RAM;
+        return true;
     }
-    residency_flat[idx] = MemoryTier::RAM;
-    residency[key] = MemoryTier::RAM;
-    return true;
+
+    residency_flat[idx] = MemoryTier::NVME;
+    residency[key] = MemoryTier::NVME;
+    return false;
 }
 
 bool ExpertMemoryManager::demote_ram_to_nvme_unlocked(int layer, int expert, TokenTimeline * /*cur_tl*/) {
@@ -970,16 +1124,19 @@ bool ExpertMemoryManager::demote_ram_to_nvme_unlocked(int layer, int expert, Tok
     const ExpertKey key{layer, expert};
     const size_t sz = (expert_flat[idx].total_bytes > 0) ? expert_flat[idx].total_bytes : expert_slice_bytes;
 
+    bool did_remove = false;
     if (ram_present_flat[idx]) {
         ram_lru.erase(ram_iter_flat[idx]);
         ram_present_flat[idx] = 0;
+        ram_used_bytes = (ram_used_bytes > sz) ? (ram_used_bytes - sz) : 0;
+        did_remove = true;
     }
     int r_slot = ram_slot_flat[idx];
     if (r_slot >= 0) {
         ram_slab_pool.release_slot(r_slot);
         ram_slot_flat[idx] = -1;
+        did_remove = true;
     }
-    ram_used_bytes = (ram_used_bytes > sz) ? (ram_used_bytes - sz) : 0;
 
     // If expert is actively present in VRAM, do NOT demote its residency to NVMe!
     if (!vram_present_flat[idx] && layer >= cfg.gpu_expert_layers) {
@@ -990,21 +1147,21 @@ bool ExpertMemoryManager::demote_ram_to_nvme_unlocked(int layer, int expert, Tok
     metrics.ram_evictions++;
     metrics.tier1_to_tier2_demotions++;
     metrics.dynamic_migrations_total++;
-    return true;
+    return did_remove;
 }
 
 bool ExpertMemoryManager::promote_expert(int layer, int expert, MemoryTier target_tier, void * stream, TokenTimeline * cur_tl) {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     return promote_expert_unlocked(layer, expert, target_tier, stream, cur_tl);
 }
 
 bool ExpertMemoryManager::demote_vram_to_ram(int layer, int expert, TokenTimeline * cur_tl) {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     return demote_vram_to_ram_unlocked(layer, expert, cur_tl);
 }
 
 bool ExpertMemoryManager::demote_ram_to_nvme(int layer, int expert, TokenTimeline * cur_tl) {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     return demote_ram_to_nvme_unlocked(layer, expert, cur_tl);
 }
 
@@ -1038,10 +1195,95 @@ size_t ExpertMemoryManager::get_ram_active_slabs() const {
     return ram_slab_pool.used_slots();
 }
 
-void ExpertMemoryManager::evict_vram(size_t needed_bytes, TokenTimeline * cur_tl) {
-    const auto t0 = clock::now();
-    while ((vram_used_bytes + needed_bytes > vram_capacity_bytes || vram_slab_pool.free_slots() == 0) && !vram_lru.empty()) {
+bool ExpertMemoryManager::enforce_kv_watermark(size_t needed_bytes, TokenTimeline * cur_tl) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
+    size_t free_vram = 0, total_vram = 0;
+    if (!atlas_cuda_mem_get_info(&free_vram, &total_vram) || total_vram == 0) {
+        free_vram = (vram_capacity_bytes > vram_used_bytes) ? (vram_capacity_bytes - vram_used_bytes) : 0;
+    }
+
+    // Emergency Flush: If free VRAM drops below 256 MiB, immediately flush dynamic slabs
+    // to prevent imminent CUDA OOM while context is scaling up.
+    if (free_vram < 256 * 1024 * 1024ULL) {
+        watermark_emergency_flushes_++;
+        while (!vram_lru.empty()) {
+            const size_t prev_lru = vram_lru.size();
+            if (!evict_vram_one_unlocked(cur_tl)) break;
+            if (vram_lru.size() == prev_lru) break;
+        }
+        return false;
+    }
+
+    // Zero-OOM Elastic Headroom check:
+    // Required free VRAM = kv_reserved_headroom_bytes_ + needed_bytes
+    const size_t target_headroom = kv_reserved_headroom_bytes_ + needed_bytes;
+    while (free_vram < target_headroom && !vram_lru.empty()) {
+        const size_t prev_lru = vram_lru.size();
         if (!evict_vram_one_unlocked(cur_tl)) break;
+        if (vram_lru.size() == prev_lru) break;
+        watermark_proactive_evictions_++;
+        if (atlas_cuda_mem_get_info(&free_vram, &total_vram)) {
+            // Updated live free VRAM
+        } else {
+            free_vram += expert_slice_bytes;
+        }
+    }
+
+    // Soft Ceiling check:
+    while ((vram_used_bytes + needed_bytes > vram_soft_capacity_bytes_ || vram_slab_pool.free_slots() == 0) && !vram_lru.empty()) {
+        const size_t prev_lru = vram_lru.size();
+        if (!evict_vram_one_unlocked(cur_tl)) break;
+        if (vram_lru.size() == prev_lru) break;
+        watermark_proactive_evictions_++;
+    }
+
+    return (free_vram >= target_headroom) || (vram_used_bytes <= min_slab_floor_bytes_);
+}
+
+void ExpertMemoryManager::sync_context_progress(int current_pos, int max_ctx_tokens, size_t kv_bytes_per_token) {
+    (void)max_ctx_tokens; (void)kv_bytes_per_token;
+    std::lock_guard<std::recursive_mutex> lock(mtx);
+    if (kv_bytes_per_token == 0) kv_bytes_per_token = 16384;
+
+    // Dynamic KV Headroom Protection:
+    // Scale reserved headroom up as context deepens to guarantee KV cache pages never collide with slabs.
+    // Baseline: 512 MiB. At 16k context: +256 MiB. At 64k context: +768 MiB (up to 1,536 MiB max headroom).
+    size_t depth_boost = (size_t(std::max(0, current_pos)) / 1024ULL) * (16ULL * 1024ULL * 1024ULL);
+    size_t dynamic_headroom = std::max<size_t>(512 * 1024 * 1024ULL,
+                               std::min<size_t>(1536 * 1024 * 1024ULL, (512 * 1024 * 1024ULL) + depth_boost));
+    kv_reserved_headroom_bytes_ = dynamic_headroom;
+
+    // Dynamic Slab Arena Soft Ceiling Elasticity:
+    // As context scales past 4k tokens, proactively shrink the slab arena soft ceiling
+    // to free up physical VRAM for incoming KV pages.
+    // Small context (<= 4k): full 1,536 MiB soft ceiling.
+    // Deep context (64k+): scales down to min_slab_floor_bytes_ (128 MiB floor).
+    if (current_pos > 4096) {
+        const size_t progress = size_t(current_pos - 4096);
+        const size_t range = 65536 - 4096; // 61440 tokens span
+        if (progress >= range) {
+            vram_soft_capacity_bytes_ = min_slab_floor_bytes_;
+        } else {
+            const size_t max_reduction = (1536 * 1024 * 1024ULL) - min_slab_floor_bytes_;
+            const size_t reduction = (progress * max_reduction) / range;
+            vram_soft_capacity_bytes_ = (1536 * 1024 * 1024ULL) - reduction;
+        }
+    } else {
+        vram_soft_capacity_bytes_ = 1536 * 1024 * 1024ULL;
+    }
+
+    enforce_kv_watermark(0, nullptr);
+}
+
+void ExpertMemoryManager::evict_vram(size_t needed_bytes, TokenTimeline * cur_tl) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
+    const auto t0 = clock::now();
+    enforce_kv_watermark(needed_bytes, cur_tl);
+    while ((vram_used_bytes + needed_bytes > vram_capacity_bytes || vram_slab_pool.free_slots() == 0) && !vram_lru.empty()) {
+        const size_t prev_lru = vram_lru.size();
+        const size_t prev_free = vram_slab_pool.free_slots();
+        if (!evict_vram_one_unlocked(cur_tl)) break;
+        if (vram_lru.size() == prev_lru && vram_slab_pool.free_slots() == prev_free) break;
     }
     if (cur_tl) {
         cur_tl->eviction_ms += elapsed_ms(t0, clock::now());
@@ -1049,9 +1291,13 @@ void ExpertMemoryManager::evict_vram(size_t needed_bytes, TokenTimeline * cur_tl
 }
 
 void ExpertMemoryManager::evict_ram(size_t needed_bytes, TokenTimeline * cur_tl) {
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const auto t0 = clock::now();
     while ((ram_used_bytes + needed_bytes > ram_capacity_bytes || ram_slab_pool.free_slots() == 0) && !ram_lru.empty()) {
+        const size_t prev_lru = ram_lru.size();
+        const size_t prev_free = ram_slab_pool.free_slots();
         if (!evict_ram_one_unlocked(cur_tl)) break;
+        if (ram_lru.size() == prev_lru && ram_slab_pool.free_slots() == prev_free) break;
     }
     if (cur_tl) {
         cur_tl->eviction_ms += elapsed_ms(t0, clock::now());
@@ -1059,7 +1305,7 @@ void ExpertMemoryManager::evict_ram(size_t needed_bytes, TokenTimeline * cur_tl)
 }
 
 MemoryTier ExpertMemoryManager::access(int layer, int expert, bool /*is_prefetch*/, TokenTimeline * cur_tl) {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const ExpertKey key{layer, expert};
     const size_t idx = size_t(layer) * 512 + size_t(expert);
 
@@ -1132,7 +1378,7 @@ void ExpertMemoryManager::quick_evict_layer_except(
 {
     if (!cfg.odmoe_quick_evict) return;
     if (layer < cfg.gpu_expert_layers) return; // GPU anchor layers are never evicted
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     const auto t0 = clock::now();
 
     for (auto it = vram_lru.begin(); it != vram_lru.end(); ) {
@@ -1145,8 +1391,7 @@ void ExpertMemoryManager::quick_evict_layer_except(
                     continue;
                 }
 
-                auto erase_it = it++;
-                vram_lru.erase(erase_it);
+                ++it;
                 demote_vram_to_ram_unlocked(victim.layer, victim.expert, cur_tl);
                 metrics.odmoe_quick_evictions++;
                 continue;
@@ -1211,7 +1456,7 @@ void ExpertMemoryManager::print_summary() const {
 }
 
 void ExpertMemoryManager::set_residency(int layer, int expert, MemoryTier tier) {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     size_t idx = size_t(layer) * 512 + size_t(expert);
     if (idx < TOTAL_EXPERTS) {
         if (tier == MemoryTier::VRAM) {
@@ -1235,7 +1480,7 @@ size_t ExpertMemoryManager::get_vram_resident_count() const {
 }
 
 void ExpertMemoryManager::apply_placement_plan(const std::vector<ExpertPlacementScore> & scores) {
-    std::lock_guard<std::mutex> lock(mtx);
+    std::lock_guard<std::recursive_mutex> lock(mtx);
     for (const auto & sc : scores) {
         if (!cfg.gpu_first && sc.layer < cfg.gpu_expert_layers) continue;
         if (sc.layer < 0 || sc.layer >= 48 || sc.expert < 0 || sc.expert >= 512) continue;
@@ -1840,8 +2085,8 @@ WorkingSetPlan MTWSPlanner::build_working_set(const std::vector<llama_token> & d
     // Dedicated working-set prefetch quotas:
     // Up to 3200 MB (~919 high-value unique experts) promoted directly into VRAM
     // Up to 3072 MB staged into host RAM
-    size_t vram_plan_target_bytes = std::min<size_t>(vram_budget_mb * 1024 * 1024 / 2, 3200 * 1024 * 1024);
-    size_t ram_plan_target_bytes  = std::min<size_t>(ram_budget_mb * 1024 * 1024 / 2, 3072 * 1024 * 1024);
+    size_t vram_plan_target_bytes = std::min<size_t>(vram_budget_mb * 1024 * 1024 / 2, size_t(3200) * 1024 * 1024);
+    size_t ram_plan_target_bytes  = std::min<size_t>(ram_budget_mb * 1024 * 1024 / 2, size_t(3072) * 1024 * 1024);
 
     for (auto & cand : ranked) {
         if (plan.vram_plan_bytes + cand.size_bytes <= vram_plan_target_bytes) {
@@ -1901,25 +2146,92 @@ void MTWSPlanner::record_demand(const WorkingSetPlan & plan, int layer, int expe
 // ---------------------------------------------------------------------------
 // Runtime
 // ---------------------------------------------------------------------------
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) void atlas_set_cpu_moe_callback(void (*cb)(int, int64_t, int64_t, uint64_t));
 extern "C" __declspec(dllimport) void atlas_set_moe_experts_callback(void (*cb)(int, int, const int32_t *, int));
+extern "C" __declspec(dllimport) void atlas_set_lookahead_preduction_callback(void (*cb)(int, const void *));
 extern "C" __declspec(dllimport) void atlas_set_entropy_k(int layer, int keep_k);
 extern "C" __declspec(dllimport) void atlas_sync_gpu_slot_lut(const int16_t * lut);
 extern "C" __declspec(dllimport) void atlas_reset_decode_step(void);
 extern "C" __declspec(dllimport) void atlas_set_is_decode(int is_decode);
+extern "C" __declspec(dllimport) void atlas_set_gpu_cache_active(int active);
+extern "C" __declspec(dllimport) void atlas_set_ram_cache_active(int active);
+extern "C" __declspec(dllimport) void atlas_set_gpu_layer_mask(uint64_t mask);
+extern "C" __declspec(dllimport) void atlas_set_ram_expert_ptr(int kind, int layer, int expert, const void * ptr);
+extern "C" __declspec(dllimport) double atlas_cpu_bench_quant_kernels(int ggml_type_id, int ncols, int iters);
+#else
+extern "C" void atlas_set_cpu_moe_callback(void (*cb)(int, int64_t, int64_t, uint64_t));
+extern "C" void atlas_set_moe_experts_callback(void (*cb)(int, int, const int32_t *, int));
+extern "C" void atlas_set_lookahead_preduction_callback(void (*cb)(int, const void *));
+extern "C" void atlas_set_entropy_k(int layer, int keep_k);
+extern "C" void atlas_sync_gpu_slot_lut(const int16_t * lut);
+extern "C" void atlas_reset_decode_step(void);
+extern "C" void atlas_set_is_decode(int is_decode);
+extern "C" void atlas_set_gpu_cache_active(int active);
+extern "C" void atlas_set_ram_cache_active(int active);
+extern "C" void atlas_set_gpu_layer_mask(uint64_t mask);
+extern "C" void atlas_set_ram_expert_ptr(int kind, int layer, int expert, const void * ptr);
+extern "C" double atlas_cpu_bench_quant_kernels(int ggml_type_id, int ncols, int iters);
+#endif
 extern void atlas_record_cpu_moe_us_cb(int layer, int64_t start_us, int64_t duration_us, uint64_t logical_bytes);
 
 static atlas::Runtime * g_active_atlas_runtime = nullptr;
 
+static inline void atlas_set_all_decode_flags(int is_decode) {
+    atlas_set_is_decode(is_decode);
+#if defined(GGML_USE_CUDA)
+    ggml_backend_cuda_atlas_moe_set_decode(is_decode);
+#endif
+}
+
+static inline void atlas_sync_unified_cache_after_step(atlas::Runtime & rt, int n_layers, bool allow_vram_promote) {
+    if (!rt.unified_cache.has_real_vram() && !rt.unified_cache.has_real_ram()) return;
+    bool dma_lut_dirty = false;
+    if (rt.direct_dma && rt.unified_cache.has_real_vram()) {
+        std::lock_guard<std::mutex> dlk(rt.pending_dma_mtx);
+        for (auto it = rt.pending_dma_jobs.begin(); it != rt.pending_dma_jobs.end(); ) {
+            if (rt.direct_dma->poll_job_complete(*it)) {
+                if (rt.unified_cache.commit_async_vram_slot(it->layer, it->expert, it->vram_slot)) {
+                    dma_lut_dirty = true;
+                }
+                it = rt.pending_dma_jobs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    const bool lut_dirty = rt.unified_cache.commit_pending_promotions(
+        rt.cpu_share_ctrl,
+        rt.unified_cache.has_real_ram(),
+        allow_vram_promote && rt.unified_cache.has_real_vram(),
+        48) || dma_lut_dirty || rt.unified_cache.consume_lut_dirty();
+#if defined(GGML_USE_CUDA)
+    if (lut_dirty && rt.unified_cache.has_real_vram()) {
+        ggml_backend_cuda_atlas_moe_sync_lut(
+            rt.unified_cache.vram_lut_flat(),
+            std::min<int>(n_layers, 48),
+            atlas::UnifiedTieredExpertCache::MAX_EXPERTS);
+    }
+#else
+    (void) lut_dirty;
+    (void) n_layers;
+#endif
+}
+
 static void atlas_slot_update_cb(int layer, int old_exp, int new_exp, int16_t slot) {
+    const bool use_real_unified = (g_active_atlas_runtime && g_active_atlas_runtime->unified_cache.has_real_vram());
     if (old_exp >= 0) {
-        atlas_set_expert_gpu_slot(layer, old_exp, -1);
+        if (!use_real_unified) {
+            atlas_set_expert_gpu_slot(layer, old_exp, -1);
+        }
         if (g_active_atlas_runtime) {
             g_active_atlas_runtime->memory_manager.demote_vram_to_ram(layer, old_exp);
         }
     }
     if (new_exp >= 0) {
-        atlas_set_expert_gpu_slot(layer, new_exp, slot);
+        if (!use_real_unified) {
+            atlas_set_expert_gpu_slot(layer, new_exp, slot);
+        }
         if (g_active_atlas_runtime) {
             g_active_atlas_runtime->memory_manager.promote_expert(layer, new_exp, MemoryTier::VRAM);
         }
@@ -1933,15 +2245,30 @@ static void atlas_record_moe_experts_cb(int layer, int n_ids, const int32_t * id
     rt->moe_callback_active = true;
 
     if (!is_decode) {
+        const bool track_vram = rt->unified_cache.has_real_vram() &&
+            (layer >= 0 && layer < 64 && ((rt->active_vram_layer_mask >> layer) & 1ULL) != 0ULL);
+        const bool track_ram = rt->unified_cache.has_real_ram();
+        const bool track_legacy = !rt->unified_cache.has_real_vram();
+        if (!track_vram && !track_ram && !track_legacy) return;
         for (int i = 0; i < n_ids; ++i) {
             int32_t exp = ids[i];
             if (exp >= 0 && exp < 512) {
-                rt->split_moe_cache->warm_expert(layer, exp);
+                if (track_legacy) {
+                    rt->split_moe_cache->warm_expert(layer, exp);
+                }
+                if (track_vram || track_ram) {
+                    rt->unified_cache.touch_or_queue_candidate(layer, exp, 0.5f);
+                }
             }
         }
     } else {
         if (layer == rt->last_moe_cb_layer) return;
         rt->last_moe_cb_layer = layer;
+
+        const bool has_real_cache = rt->unified_cache.has_real_vram() || rt->unified_cache.has_real_ram();
+        const bool needs_legacy_split =
+            !rt->cfg.trace_output_path.empty() || rt->cfg.test_tier != 0 || rt->cfg.simulate_placement || rt->cfg.enable_mtws;
+        if (!has_real_cache && !needs_legacy_split) return;
 
         std::vector<int> actual_token;
         actual_token.reserve(n_ids);
@@ -1952,6 +2279,11 @@ static void atlas_record_moe_experts_cb(int layer, int n_ids, const int32_t * id
             }
         }
         if (!actual_token.empty()) {
+            if (rt->unified_cache.has_real_vram() || rt->unified_cache.has_real_ram()) {
+                for (int exp : actual_token) {
+                    rt->unified_cache.touch_or_queue_candidate(layer, exp, 1.0f);
+                }
+            }
             auto plan = rt->split_moe_cache->plan_split_execution(layer, actual_token);
             for (int exp : plan.cpu) {
                 if (auto info = rt->memory_manager.get_expert_info(layer, exp)) {
@@ -1984,9 +2316,12 @@ Runtime::Runtime(const Config & c) :
     grouped_pipeline(c.cuda_streams, c.grouped_gemm, c.async_h2d),
     slack_estimator(c.tlep_min_guard_ms),
     prefetch_scheduler(memory_manager, c.tlep_pf_bw_budget_mb * 1024 * 1024),
-    state_cache(c.prompt_cache_mb > 0 ? (size_t(c.prompt_cache_mb) * 1024 * 1024ULL) : AtlasHybridStateCache::DEFAULT_MAX_L1_BYTES, "models/cache")
+    state_cache(c.prompt_cache_mb > 0 ? (size_t(c.prompt_cache_mb) * 1024 * 1024ULL) : AtlasHybridStateCache::DEFAULT_MAX_L1_BYTES, "models/cache"),
+    cpu_share_ctrl(c.moe_cache_cpu_share)
 {
     g_active_atlas_runtime = this;
+    atlas_set_gpu_cache_active(0);
+    atlas_set_ram_cache_active(0);
     atlas_set_cpu_moe_callback(atlas_record_cpu_moe_us_cb);
     atlas_set_moe_experts_callback(atlas_record_moe_experts_cb);
     moe_callback_active = true;
@@ -2017,10 +2352,11 @@ Runtime::Runtime(const Config & c) :
 
     if (cfg.enable_tutti) {
         tutti_pipeline = std::make_unique<TuttiAsyncPipeline>(cfg, host_staging_pool);
+        direct_storage = std::make_unique<WindowsDirectStorageExpertStreamer>();
         std::printf("[ATLAS] Async expert page warming: ENABLED (OS hints, no pinned staging or dynamic H2D)\n");
     }
     if (cfg.page_prefetch) {
-        page_prefetcher = new PagePrefetcher();
+        page_prefetcher = new PagePrefetcher(&memory_manager);
         std::printf("[ATLAS] PagePrefetcher: ENABLED (batched PrefetchVirtualMemory mode)\n");
     } else {
         std::printf("[ATLAS] PagePrefetcher: DISABLED (residency-only mode)\n");
@@ -2031,6 +2367,97 @@ Runtime::Runtime(const Config & c) :
             std::printf("[ATLAS] Warning: failed to open trace file: %s\n",
                 cfg.trace_output_path.c_str());
     }
+
+    // Phase 16: Setup High-Priority CUDA DMA Streams & io_uring
+#if defined(__linux__)
+    void * hCuda = atlas_get_libcuda_handle();
+    if (hCuda) {
+        using cuDevicePrimaryCtxRetain_t = int (*)(void **, int);
+        using cuCtxSetCurrent_t = int (*)(void *);
+        auto fnRetainCtx = (cuDevicePrimaryCtxRetain_t)dlsym(hCuda, "cuDevicePrimaryCtxRetain");
+        auto fnSetCtx = (cuCtxSetCurrent_t)dlsym(hCuda, "cuCtxSetCurrent");
+        if (fnRetainCtx && fnSetCtx) {
+            void * ctx = nullptr;
+            if (fnRetainCtx(&ctx, 0) == 0 && ctx) {
+                fnSetCtx(ctx);
+            }
+        }
+        using cuStreamCreateWithPriority_t = int (*)(void **, unsigned int, int);
+        auto fnStreamCreate = (cuStreamCreateWithPriority_t)dlsym(hCuda, "cuStreamCreateWithPriority");
+        if (fnStreamCreate) {
+            fnStreamCreate(&dma_stream, 0x01, -1);
+            fnStreamCreate(&draft_stream, 0x01, 0);
+        }
+    }
+
+    const char * model_path_env = std::getenv("TENDOU_MODEL_FILE");
+    if (!model_path_env) model_path_env = std::getenv("ATLAS_MODEL_FILE");
+    if (model_path_env && model_path_env[0] != '\0') {
+        int mfd = open(model_path_env, O_RDONLY | O_DIRECT);
+        if (mfd < 0) {
+            mfd = open(model_path_env, O_RDONLY);
+        }
+        if (mfd >= 0) {
+            direct_dma = std::make_unique<DirectStorageIoUringDMA>(mfd, dma_stream);
+            std::string p0 = model_path_env;
+            static const char * BLOB_ENV_VARS[3] = {
+                "TENDOU_MODEL_BLOB_1",
+                "TENDOU_MODEL_BLOB_2",
+                "TENDOU_MODEL_BLOB_3"
+            };
+            for (int b = 1; b < 3; ++b) {
+                const char * b_env = std::getenv(BLOB_ENV_VARS[b]);
+                std::string b_path = (b_env && b_env[0]) ? b_env : "";
+                if (b_path.empty()) {
+                    char needle[32], repl[32];
+                    std::snprintf(needle, sizeof(needle), "-%05d-of-", 1);
+                    std::snprintf(repl, sizeof(repl), "-%05d-of-", b + 1);
+                    size_t pos = p0.find(needle);
+                    if (pos != std::string::npos) {
+                        b_path = p0;
+                        b_path.replace(pos, std::strlen(needle), repl);
+                    }
+                }
+                if (!b_path.empty()) {
+                    int b_fd = open(b_path.c_str(), O_RDONLY | O_DIRECT);
+                    if (b_fd < 0) b_fd = open(b_path.c_str(), O_RDONLY);
+                    if (b_fd >= 0) direct_dma->set_blob_fd(b, b_fd);
+                }
+            }
+            std::printf("[ATLAS-P16] Direct Tier-2->Tier-0 io_uring DMA: INITIALIZED (%s)\n",
+                        direct_dma->is_sqpoll() ? "SQPOLL" : "Standard Ring");
+        }
+    }
+#endif
+
+    const char * thresh_env = std::getenv("ATLAS_PREFILL_THRESHOLD");
+    if (thresh_env && thresh_env[0] != '\0') {
+        int th = std::atoi(thresh_env);
+        if (th > 0) l_prefill_threshold = size_t(th);
+    } else {
+        l_prefill_threshold = 64; // Set to 64 as per user request
+    }
+
+    const char * lpf_env = std::getenv("ATLAS_LAYER_WISE_PREFILL");
+    if (lpf_env && std::string(lpf_env) == "0") {
+        enable_layer_wise_prefill = false;
+    }
+
+    const char * slab_mib_env = std::getenv("ATLAS_DYNAMIC_SLAB_MIB");
+    if (slab_mib_env && slab_mib_env[0] != '\0') {
+        int mib = std::atoi(slab_mib_env);
+        if (mib > 0) {
+            memory_manager.set_vram_soft_capacity(size_t(mib) * 1024 * 1024ULL);
+        }
+    }
+
+    h_lookahead_logits = (float *)malloc(512 * sizeof(float));
+
+    atlas_set_lookahead_preduction_callback([](int layer, const void * cur_hidden) {
+        if (g_active_atlas_runtime) {
+            g_active_atlas_runtime->execute_lookahead_router_preduction(layer, cur_hidden);
+        }
+    });
 }
 
 void Runtime::flush_telemetry() {
@@ -2043,7 +2470,63 @@ void Runtime::flush_telemetry() {
     }
 }
 
+void Runtime::unlock_hot_ram() {
+    for (const auto & span : hot_ram_locked_spans) {
+        if (span.first && span.second > 0) {
+#if defined(_WIN32)
+            VirtualUnlock(span.first, span.second);
+#else
+            munlock(span.first, span.second);
+#endif
+        }
+    }
+    hot_ram_locked_spans.clear();
+    hot_ram_pinned_bytes = 0;
+}
+
 Runtime::~Runtime() {
+    atlas_set_gpu_cache_active(0);
+    atlas_set_ram_cache_active(0);
+    atlas_set_gpu_layer_mask(~0ULL);
+#if defined(GGML_USE_CUDA)
+    ggml_backend_cuda_atlas_moe_set_active(0);
+    ggml_backend_cuda_atlas_moe_set_layer_mask(~0ULL);
+    ggml_backend_cuda_atlas_moe_set_arena(0, 0, 0);
+#endif
+    atlas_set_lookahead_preduction_callback(nullptr);
+    {
+        std::lock_guard<std::mutex> dlk(pending_dma_mtx);
+        for (auto & job : pending_dma_jobs) {
+            if (direct_dma) {
+                direct_dma->abort_job(job);
+            }
+            if (job.vram_slot >= 0) {
+                unified_cache.abort_async_vram_slot(job.vram_slot);
+            }
+        }
+        pending_dma_jobs.clear();
+    }
+    unified_cache.shutdown();
+    unlock_hot_ram();
+    if (h_lookahead_logits) {
+        free(h_lookahead_logits);
+        h_lookahead_logits = nullptr;
+    }
+#if defined(__linux__)
+    if (dma_stream || draft_stream) {
+        void * hCuda = atlas_get_libcuda_handle();
+        if (hCuda) {
+            using cuStreamDestroy_t = int (*)(void *);
+            auto fnStreamDestroy = (cuStreamDestroy_t)dlsym(hCuda, "cuStreamDestroy");
+            if (fnStreamDestroy) {
+                if (dma_stream) fnStreamDestroy(dma_stream);
+                if (draft_stream) fnStreamDestroy(draft_stream);
+            }
+        }
+        dma_stream = nullptr;
+        draft_stream = nullptr;
+    }
+#endif
     flush_telemetry();
     if (g_active_atlas_runtime == this) {
         g_active_atlas_runtime = nullptr;
@@ -2537,6 +3020,10 @@ void Runtime::execute_odmoe_spice_prefetch(int current_layer, const std::vector<
 
             if (!cfg.enable_spice) {
                 if (tutti_pipeline && pe) tutti_pipeline->enqueue_read(tgt_layer, pred.expert, pe);
+                if (direct_storage && pe && !pe->chunks.empty()) {
+                    direct_storage->enqueue_speculative_read(tgt_layer, pred.expert, pe->chunks[0].file_offset,
+                        std::min<size_t>(pe->total_bytes > 0 ? pe->total_bytes : 3481600, WindowsDirectStorageExpertStreamer::STAGING_SLOT_BYTES));
+                }
             } else if (pred.conf_tier == ConfidenceTier::HIGH) {
                 m.spice_vram_scheduled++;
                 if (cfg.dynamic_cascading_working_set) {
@@ -2550,6 +3037,10 @@ void Runtime::execute_odmoe_spice_prefetch(int current_layer, const std::vector<
                 if (cfg.enable_tutti && tutti_pipeline && pe) {
                     tutti_pipeline->enqueue_read(tgt_layer, pred.expert, pe);
                 }
+                if (direct_storage && pe && !pe->chunks.empty()) {
+                    direct_storage->enqueue_speculative_read(tgt_layer, pred.expert, pe->chunks[0].file_offset,
+                        std::min<size_t>(pe->total_bytes > 0 ? pe->total_bytes : 3481600, WindowsDirectStorageExpertStreamer::STAGING_SLOT_BYTES));
+                }
             } else if (pred.conf_tier == ConfidenceTier::MEDIUM) {
                 m.spice_ram_scheduled++;
                 if (cfg.dynamic_cascading_working_set) {
@@ -2559,6 +3050,10 @@ void Runtime::execute_odmoe_spice_prefetch(int current_layer, const std::vector<
                 }
                 if (cfg.enable_tutti && tutti_pipeline && pe) {
                     tutti_pipeline->enqueue_read(tgt_layer, pred.expert, pe);
+                }
+                if (direct_storage && pe && !pe->chunks.empty()) {
+                    direct_storage->enqueue_speculative_read(tgt_layer, pred.expert, pe->chunks[0].file_offset,
+                        std::min<size_t>(pe->total_bytes > 0 ? pe->total_bytes : 3481600, WindowsDirectStorageExpertStreamer::STAGING_SLOT_BYTES));
                 }
             } else {
                 m.spice_nvme_left++;
@@ -2581,6 +3076,215 @@ void Runtime::execute_odmoe_quick_evict(int completed_layer) {
     memory_manager.quick_evict_layer_except(completed_layer, keep_experts, &current_timeline);
 }
 
+void Runtime::execute_lookahead_router_preduction(int current_layer, const void * /*cur_hidden*/) {
+    if (current_layer < 0 || current_layer >= 45) return;
+    if (current_layer <= last_preduction_layer && current_layer != 0) return;
+    if (current_layer == 0) last_preduction_layer = -1;
+    last_preduction_layer = current_layer;
+
+    // Use current layer activations if already populated, or previous layer active experts as residual proxy
+    const std::vector<int> & active_ref = (!last_layer_experts[current_layer].empty())
+        ? last_layer_experts[current_layer]
+        : ((current_layer > 0 && !last_layer_experts[current_layer - 1].empty())
+            ? last_layer_experts[current_layer - 1]
+            : std::vector<int>{});
+
+    // Residual Lookahead Horizon H = 1..2 (focused next-layer non-blocking prefetch)
+    std::vector<PrefetchRange> pf_ranges;
+    for (int h = 1; h <= 2 && (current_layer + h) < 48; ++h) {
+        int target_layer = current_layer + h;
+        auto preds = predictor.predict_layer_lead_with_confidence(
+            current_layer, target_layer, active_ref, 3);
+
+        for (const auto & pred : preds) {
+            const auto * pe = memory_manager.get_expert_info(target_layer, pred.expert);
+            if (!pe) continue;
+            if (pred.confidence >= 0.60) {
+                // Tier-0 Promotion: track residency in VRAM Dynamic Slab Arena
+                memory_manager.promote_expert(target_layer, pred.expert, MemoryTier::VRAM, dma_stream, &current_timeline);
+
+                if (direct_dma && !pe->chunks.empty()) {
+                    if (unified_cache.has_real_vram()) {
+                        const bool layer_ok = (target_layer >= 0 && target_layer < 64 &&
+                            ((active_vram_layer_mask >> target_layer) & 1ULL) != 0ULL);
+                        if (layer_ok && unified_cache.get_vram_slot(target_layer, pred.expert) < 0) {
+                            auto res = unified_cache.reserve_async_vram_slot(target_layer, pred.expert);
+                            if (res.valid()) {
+                                int      blob_idxs[3]    = {0, 0, 0};
+                                uint64_t file_offsets[3] = {0, 0, 0};
+                                size_t   byte_sizes[3]   = {0, 0, 0};
+                                const int n_chunks = std::min<int>(3, (int)pe->chunks.size());
+                                for (int c = 0; c < n_chunks; ++c) {
+                                    const auto & ch = pe->chunks[size_t(c)];
+                                    blob_idxs[c]    = (ch.blob_idx >= 0 && ch.blob_idx < 3) ? ch.blob_idx : 0;
+                                    file_offsets[c] = ch.file_offset;
+                                    const size_t max_b = (res.bytes[c] > 0) ? res.bytes[c] : ch.size_bytes;
+                                    byte_sizes[c]   = (ch.size_bytes > 0) ? std::min<size_t>(ch.size_bytes, max_b) : res.bytes[c];
+                                }
+                                ExpertDmaJob job{};
+                                if (direct_dma->enqueue_expert_3tensor_read(
+                                        target_layer, pred.expert, res.slot,
+                                        blob_idxs, file_offsets, byte_sizes,
+                                        res.dev_ptrs, n_chunks, job)) {
+                                    std::lock_guard<std::mutex> dlk(pending_dma_mtx);
+                                    pending_dma_jobs.push_back(job);
+                                } else {
+                                    unified_cache.abort_async_vram_slot(res.slot);
+                                }
+                            }
+                        }
+                    } else {
+                        int slot = direct_dma->acquire_free_slot();
+                        if (slot >= 0) {
+                            size_t bytes = pe->total_bytes > 0 ? pe->total_bytes : 1253376;
+                            int blob = (pe->chunks[0].blob_idx >= 0 && pe->chunks[0].blob_idx < 3) ? pe->chunks[0].blob_idx : 0;
+                            void * vram_dest = memory_manager.get_vram_slot_ptr(target_layer, pred.expert);
+                            if (vram_dest && direct_dma->enqueue_ssd_read(slot, pe->chunks[0].file_offset, bytes, target_layer, pred.expert, blob)) {
+                                direct_dma->dispatch_to_vram_async(slot, vram_dest, bytes);
+                            }
+                            direct_dma->release_slot(slot);
+                        }
+                    }
+                }
+            } else if (pred.confidence >= 0.30) {
+                // Tier-1 Promotion: track physical residency in RAM
+                memory_manager.promote_expert(target_layer, pred.expert, MemoryTier::RAM, nullptr, &current_timeline);
+            }
+
+            if (!pe->chunks.empty() && (!direct_dma || pred.confidence < 0.60)) {
+                for (const auto & ch : pe->chunks) {
+                    if (ch.blob_idx >= 0 && ch.blob_idx < 3) {
+                        pf_ranges.push_back({ch.blob_idx, ch.file_offset, ch.size_bytes});
+                    }
+                }
+            }
+        }
+    }
+    if (!pf_ranges.empty() && page_prefetcher) {
+        static_cast<PagePrefetcher *>(page_prefetcher)->enqueue(pf_ranges.data(), pf_ranges.size());
+    }
+}
+
+bool Runtime::execute_layer_wise_single_pass_prefill(
+    llama_context * ctx,
+    const std::vector<llama_token> & prompt_tokens,
+    size_t reused_tokens,
+    void * spec_ptr,
+    size_t stable_end,
+    std::vector<llama_token> * stable_prompt,
+    std::vector<uint8_t> * stable_state,
+    std::vector<uint8_t> * stable_spec_state,
+    size_t max_cache_bytes,
+    const std::string & req_id,
+    const std::atomic<bool> * cancel_flag) {
+    if (!ctx || prompt_tokens.empty()) return false;
+    const size_t total_tokens = prompt_tokens.size();
+    if (total_tokens <= reused_tokens) return true;
+    const size_t eval_count = total_tokens - reused_tokens;
+    if (eval_count < l_prefill_threshold) return false;
+
+    auto * spec = static_cast<common_speculative *>(spec_ptr);
+
+    // 1. Proactively notify ExpertMemoryManager of context progression
+    // so Zero-OOM Elastic Watermarking guarantees KV cache headroom upfront
+    memory_manager.sync_context_progress((int)total_tokens, (int)total_tokens + 512, 16384);
+
+    // 2. Set Quality-Safe Layer-Wise Prefill Routing:
+    // Core reasoning (15-30), entry (0-1), and output (44-47) layers keep K=4 for full tool/schema precision;
+    // outer layers (2-14, 31-43) use K=3 (never K=2, which degrades CoT/tool grounding).
+    for (int l = 0; l < 48; ++l) {
+        const int pf_k = (l < 2 || (l >= 15 && l <= 30) || l >= 44) ? 4 : 3;
+        atlas_set_entropy_k(l, pf_k);
+    }
+
+    const int n_batch = llama_n_batch(ctx);
+    llama_batch p_batch = llama_batch_init(n_batch, 0, 1);
+    bool success = true;
+    g_ipc_phase.store(1);
+    g_ipc_prefill_pos.store((int)reused_tokens);
+    g_ipc_prefill_total.store((int)total_tokens);
+
+    for (size_t i = reused_tokens; i < total_tokens;) {
+        if (cancel_flag && cancel_flag->load()) {
+            success = false;
+            break;
+        }
+        size_t n_eval = std::min<size_t>(n_batch, total_tokens - i);
+        if (stable_end >= 16 && i < stable_end) {
+            n_eval = std::min(n_eval, stable_end - i);
+        }
+        common_batch_clear(p_batch);
+        for (size_t k = 0; k < n_eval; ++k) {
+            common_batch_add(p_batch, prompt_tokens[i + k], (llama_pos)(i + k), { 0 }, (i + k == total_tokens - 1));
+        }
+
+        const int decode_ret = llama_decode(ctx, p_batch);
+        if (decode_ret != 0) {
+            success = false;
+            break;
+        }
+
+        // Full Prompt Indexing for Speculative Engine (PLD / MTP):
+        // Feed every evaluated batch chunk so prompt lookup trie is fully populated
+        if (spec) {
+            if (!common_speculative_process(spec, p_batch)) {
+                success = false;
+                break;
+            }
+        }
+
+        i += n_eval;
+        g_ipc_prefill_pos.store((int)i);
+
+        // Save stable checkpoint for prefix caching if aligned at stable_end
+        if (stable_end >= 16 && i == stable_end && stable_state && stable_prompt) {
+            const size_t sz = llama_state_get_size(ctx);
+            if (sz > 0 && (max_cache_bytes == 0 || sz <= max_cache_bytes)) {
+                try {
+                    stable_state->resize(sz);
+                    if (llama_state_get_data(ctx, stable_state->data(), sz) == sz) {
+                        stable_prompt->assign(prompt_tokens.begin(), prompt_tokens.begin() + stable_end);
+                        if (spec && stable_spec_state) {
+                            common_speculative_get_state(spec, 0, *stable_spec_state);
+                        }
+                    } else {
+                        std::vector<uint8_t>().swap(*stable_state);
+                    }
+                } catch (const std::bad_alloc &) {
+                    stable_prompt->clear();
+                    std::vector<uint8_t>().swap(*stable_state);
+                    if (stable_spec_state) stable_spec_state->clear();
+                }
+            }
+        }
+
+        // Emit heartbeat ping so server and client watchdog stay alive
+        nlohmann::json ping_ev = {
+            {"event", "ping"},
+            {"id", req_id},
+            {"progress", (int)i},
+            {"total", (int)total_tokens}
+        };
+        ipc_emit(ping_ev);
+    }
+
+    // Always reset entropy K table back to normal so generation decode gets full Top-K
+    for (int l = 0; l < 48; ++l) {
+        atlas_set_entropy_k(l, 0);
+    }
+
+    llama_batch_free(p_batch);
+    if (!success) {
+        llama_synchronize(ctx);
+        if (reused_tokens == 0) {
+            llama_memory_clear(llama_get_memory(ctx), false);
+        } else if (stable_state && !stable_state->empty()) {
+            llama_state_set_data(ctx, stable_state->data(), stable_state->size());
+        }
+        llama_synchronize(ctx);
+    }
+    return success;
+}
 
 void Runtime::print_gpu_first_report() const {
     const auto & m = memory_manager.get_metrics();
@@ -3053,6 +3757,105 @@ inline bool atlas_configure_cuda_primary_ctx(const std::string & mode_raw) {
     return true;
 }
 
+using atlas::PrefixCacheSlot;
+using atlas::PrefixCache;
+
+template <typename EmitFn>
+struct IpcTokenEmitter {
+    const std::string & req_id;
+    const std::vector<std::string> & stops;
+    const EmitFn & emit_fn;
+    std::string pending;
+    int last_token_id = -1;
+    size_t max_stop_len = 0;
+
+    IpcTokenEmitter(
+        const std::string & id,
+        const std::vector<std::string> & stop_seqs,
+        const EmitFn & fn)
+        : req_id(id), stops(stop_seqs), emit_fn(fn) {
+        for (const auto & s : stops) {
+            if (s.size() > max_stop_len) max_stop_len = s.size();
+        }
+    }
+
+    void emit_raw(const std::string & text, int token_id) {
+        if (text.empty()) return;
+        emit_fn({
+            {"event", "token"},
+            {"id", req_id},
+            {"token", text},
+            {"token_id", token_id}
+        });
+    }
+
+    bool push(llama_token tok, const std::string & piece, bool is_eog, std::string & full_response) {
+        if (is_eog) {
+            flush();
+            return true;
+        }
+        full_response += piece;
+        pending += piece;
+        last_token_id = (int)tok;
+
+        if (max_stop_len == 0) {
+            emit_raw(pending, last_token_id);
+            pending.clear();
+            return false;
+        }
+
+        size_t earliest = std::string::npos;
+        for (const auto & s : stops) {
+            if (s.empty()) continue;
+            size_t pos = pending.find(s);
+            if (pos != std::string::npos && (earliest == std::string::npos || pos < earliest)) {
+                earliest = pos;
+            }
+        }
+        if (earliest != std::string::npos) {
+            const size_t drop_bytes = pending.size() - earliest;
+            if (full_response.size() >= drop_bytes) {
+                full_response.resize(full_response.size() - drop_bytes);
+            }
+            std::string safe = pending.substr(0, earliest);
+            pending.clear();
+            emit_raw(safe, last_token_id);
+            return true;
+        }
+
+        size_t hold = 0;
+        const size_t max_check = std::min(pending.size(), max_stop_len > 0 ? max_stop_len - 1 : size_t(0));
+        for (size_t k = max_check; k > 0; --k) {
+            bool is_prefix = false;
+            for (const auto & s : stops) {
+                if (s.size() > k && pending.compare(pending.size() - k, k, s, 0, k) == 0) {
+                    is_prefix = true;
+                    break;
+                }
+            }
+            if (is_prefix) {
+                hold = k;
+                break;
+            }
+        }
+
+        if (pending.size() > hold) {
+            const size_t emit_len = pending.size() - hold;
+            std::string out = pending.substr(0, emit_len);
+            pending.erase(0, emit_len);
+            emit_raw(out, last_token_id);
+        }
+        return false;
+    }
+
+    void flush() {
+        if (!pending.empty()) {
+            emit_raw(pending, last_token_id);
+            pending.clear();
+        }
+    }
+};
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -3289,8 +4092,71 @@ int main(int argc, char ** argv) {
             cfg.tlep_pf_bw_budget_mb = std::stoull(argv[++i]);
         } else if (arg == "--atlas-tlep-conf" && i + 1 < argc) {
             cfg.tlep_conf_threshold = std::stod(argv[++i]);
+        } else if ((arg == "--atlas-moe-cache-cpu-share" || arg == "--moe-cache-cpu-share") && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto") {
+                cfg.moe_cache_cpu_share = -1.0;
+            } else {
+                cfg.moe_cache_cpu_share = std::max(0.0, std::min(1.0, std::stod(val)));
+            }
+        } else if (arg == "--atlas-no-sync-cache") {
+            cfg.no_sync_cache = true;
+            if (i + 1 < argc && (std::string(argv[i+1]) == "0" || std::string(argv[i+1]) == "1")) {
+                cfg.no_sync_cache = (std::stoi(argv[++i]) != 0);
+            }
+        } else if (arg == "--atlas-ffn-chunk-size" && i + 1 < argc) {
+            cfg.ffn_chunk_size = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--atlas-fp8-kv") {
+            cfg.fp8_kv = true;
+            if (i + 1 < argc && (std::string(argv[i+1]) == "0" || std::string(argv[i+1]) == "1")) {
+                cfg.fp8_kv = (std::stoi(argv[++i]) != 0);
+            }
+        } else if (arg == "--atlas-load-mode" && i + 1 < argc) {
+            cfg.load_mode = argv[++i];
+        } else if (arg == "--atlas-cpu-bench") {
+            cfg.cpu_bench = true;
+            if (i + 1 < argc && (std::string(argv[i+1]) == "0" || std::string(argv[i+1]) == "1")) {
+                cfg.cpu_bench = (std::stoi(argv[++i]) != 0);
+            }
+        } else if (arg == "--atlas-mtp-vocab-shortlist" && i + 1 < argc) {
+            cfg.mtp_vocab_shortlist = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--atlas-hc-fusion") {
+            cfg.hc_fusion = true;
+            if (i + 1 < argc && (std::string(argv[i+1]) == "0" || std::string(argv[i+1]) == "1")) {
+                cfg.hc_fusion = (std::stoi(argv[++i]) != 0);
+            }
+        } else if (arg == "--atlas-tutti-threads" && i + 1 < argc) {
+            cfg.tutti_threads = std::max(1, std::min(8, std::stoi(argv[++i])));
+        } else if (arg == "--atlas-vram-layer-cap" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto") {
+                cfg.vram_layer_cap = 0;
+            } else if (val == "all") {
+                cfg.vram_layer_cap = -1;
+            } else {
+                cfg.vram_layer_cap = std::max(0, std::min(48, std::stoi(val)));
+            }
+        } else if (arg == "--atlas-ram-lock-policy" && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "auto" || val == "on" || val == "off") {
+                cfg.ram_lock_policy = val;
+            }
         } else {
             llama_argv.push_back(argv[i]);
+        }
+    }
+
+    if (cfg.vram_layer_cap == 0) {
+        if (const char * env_cap = std::getenv("TENDOU_VRAM_LAYER_CAP"); env_cap && env_cap[0] != '\0') {
+            std::string val(env_cap);
+            if (val == "all") cfg.vram_layer_cap = -1;
+            else if (val != "auto") cfg.vram_layer_cap = std::max(0, std::min(48, std::atoi(env_cap)));
+        }
+    }
+    if (cfg.ram_lock_policy == "auto") {
+        if (const char * env_rlp = std::getenv("TENDOU_RAM_LOCK_POLICY"); env_rlp && env_rlp[0] != '\0') {
+            std::string val(env_rlp);
+            if (val == "on" || val == "off" || val == "auto") cfg.ram_lock_policy = val;
         }
     }
 
@@ -3520,12 +4386,20 @@ int main(int argc, char ** argv) {
     // Product-level: automatically offload to GPU via -ngl 99 if not explicitly passed by user
     bool user_set_ngl = false;
     bool user_set_ctx = false;
+    bool user_set_batch = false;
+    bool user_set_ubatch = false;
     for (int i = 0; i < (int)llama_argv.size(); ++i) {
         if (std::string(llama_argv[i]) == "-ngl" || std::string(llama_argv[i]) == "--n-gpu-layers") {
             user_set_ngl = true;
         }
         if (std::string(llama_argv[i]) == "-c" || std::string(llama_argv[i]) == "--ctx-size") {
             user_set_ctx = true;
+        }
+        if (std::string(llama_argv[i]) == "-b" || std::string(llama_argv[i]) == "--batch-size") {
+            user_set_batch = true;
+        }
+        if (std::string(llama_argv[i]) == "-ub" || std::string(llama_argv[i]) == "--ubatch-size") {
+            user_set_ubatch = true;
         }
     }
     if (!user_set_ngl && !cfg.cpu_only) {
@@ -3557,24 +4431,48 @@ int main(int argc, char ** argv) {
     // Speculation and sampling must be explicit. Unused rollback slots waste recurrent memory in IPC.
 
     if (cfg.gpu_first && !cfg.cpu_only) {
-        // Enforce safe memory envelope on 8GB RTX 5060:
-        // Keep batch=256 and ubatch=64 to ensure compute graph workspace is compact (~30 MiB)
-        // so that cuBLAS workspace never collides with weights and KV cache.
+        // Default safe memory envelope on 8GB RTX 5060 while respecting explicit -b/-ub overrides:
+        // larger ubatch (128 default, up to 256 explicit) sharply cuts mmap weight sweep passes during prefill.
         if (!user_set_ctx && (params.n_ctx == 0 || params.n_ctx > 4096)) {
             params.n_ctx = 4096;
         }
-        const char * chunk_sz_env = std::getenv("ATLAS_PREFILL_CHUNK_SIZE");
+        const char * chunk_sz_env = std::getenv("ATLAS_PREFILL_CHUNK");
         if (chunk_sz_env && chunk_sz_env[0] != '\0') {
             int sz = std::atoi(chunk_sz_env);
-            if (sz >= 16 && sz <= 2048) {
+            if (sz >= 16 && sz <= 4096) {
                 params.n_batch = sz;
             }
-        } else if (params.n_batch == 0 || params.n_batch > 256) {
-            params.n_batch = 256;
+        } else if (user_set_batch) {
+            params.n_batch = std::max<int32_t>(16, std::min<int32_t>(4096, params.n_batch > 0 ? params.n_batch : 512));
+        } else {
+            params.n_batch = (cfg.ffn_chunk_size > 0 && params.n_ctx < 32768) ? 1024 : 512;
         }
-        if (params.n_ubatch == 0 || params.n_ubatch > 64) {
-            params.n_ubatch = 64;
+        const int32_t max_ub = (cfg.ffn_chunk_size > 0 && params.n_ctx < 32768) ? 2048 : 256;
+        if (user_set_ubatch) {
+            params.n_ubatch = std::max<int32_t>(16, std::min<int32_t>(max_ub, params.n_ubatch > 0 ? params.n_ubatch : 256));
+        } else {
+            // Keep default physical ubatch at 128: forcing 256 spills L3/VRAM compute headroom and halves prefill TPS.
+            // Large explicit -ub (up to 2048) remains permitted above when cfg.ffn_chunk_size > 0.
+            params.n_ubatch = 128;
         }
+        if (params.n_batch < params.n_ubatch) {
+            params.n_batch = params.n_ubatch;
+        }
+    }
+
+    if (!std::getenv("ATLAS_GPU_MOE_CACHE") && (cfg.cpu_only || cfg.vram_cache_mb <= 0)) {
+#if defined(_WIN32)
+        _putenv_s("ATLAS_GPU_MOE_CACHE", "0");
+#else
+        setenv("ATLAS_GPU_MOE_CACHE", "0", 0);
+#endif
+    }
+    if (!std::getenv("ATLAS_FFN_CHUNK_SIZE")) {
+#if defined(_WIN32)
+        _putenv_s("ATLAS_FFN_CHUNK_SIZE", std::to_string(cfg.ffn_chunk_size).c_str());
+#else
+        setenv("ATLAS_FFN_CHUNK_SIZE", std::to_string(cfg.ffn_chunk_size).c_str(), 0);
+#endif
     }
 
     // Configure ngram-simple to safe bounds for hybrid recurrent MoE on 8GB VRAM
@@ -3606,17 +4504,24 @@ int main(int argc, char ** argv) {
     if (!observe_router) cfg.enable_mtws = false;
     params.warmup = false;
 
-    // Phase 8 Task D.1 & Phase 9 M3.1: Adaptive / Asymmetric KV Cache Quantization
-    if (params.n_ctx > 8192) {
+    // Phase 8 + Phase 17 (PR #28392): Adaptive / FP8 E4M3 KV Cache Quantization
+    if (params.n_ctx > 32768) {
         if (params.cache_type_v == GGML_TYPE_F16 || params.cache_type_v == GGML_TYPE_Q8_0) {
             params.cache_type_v = GGML_TYPE_Q4_0;
         }
         if (params.cache_type_k == GGML_TYPE_F16) {
-            params.cache_type_k = GGML_TYPE_Q8_0;
+            params.cache_type_k = cfg.fp8_kv ? GGML_TYPE_F8_E4M3 : GGML_TYPE_Q8_0;
+        }
+    } else if (params.n_ctx > 8192) {
+        if (params.cache_type_v == GGML_TYPE_F16 || params.cache_type_v == GGML_TYPE_Q8_0) {
+            params.cache_type_v = cfg.fp8_kv ? GGML_TYPE_F8_E4M3 : GGML_TYPE_Q4_0;
+        }
+        if (params.cache_type_k == GGML_TYPE_F16) {
+            params.cache_type_k = cfg.fp8_kv ? GGML_TYPE_F8_E4M3 : GGML_TYPE_Q8_0;
         }
     } else {
-        if (params.cache_type_k == GGML_TYPE_F16) params.cache_type_k = GGML_TYPE_Q8_0;
-        if (params.cache_type_v == GGML_TYPE_F16) params.cache_type_v = GGML_TYPE_Q8_0;
+        if (params.cache_type_k == GGML_TYPE_F16) params.cache_type_k = cfg.fp8_kv ? GGML_TYPE_F8_E4M3 : GGML_TYPE_Q8_0;
+        if (params.cache_type_v == GGML_TYPE_F16) params.cache_type_v = cfg.fp8_kv ? GGML_TYPE_F8_E4M3 : GGML_TYPE_Q8_0;
     }
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
@@ -3624,11 +4529,49 @@ int main(int argc, char ** argv) {
     static const char * moe_pattern = R"(blk\.\d+\.ffn_(up|down|gate_up|gate)_exps)";
     std::vector<llama_model_tensor_buft_override> overrides;
     static std::string cpu_moe_pattern_storage;
+#if defined(GGML_USE_CUDA)
+    if (cfg.gpu_first && !cfg.cpu_only && cfg.gpu_expert_layers > 0 && cfg.gpu_expert_layers <= 4) {
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_cuda_get_device_memory(0, &free_b, &total_b);
+        const size_t free_mb = free_b / (1024ULL * 1024ULL);
+        const size_t total_mb = total_b / (1024ULL * 1024ULL);
+        if (total_mb > 0 && total_mb < 9500) {
+            if (free_mb < 7100 && params.n_ctx >= 32768) {
+                std::fprintf(stderr, "[ATLAS] VRAM Guard: free=%zu MiB with n_ctx=%u -> auto-stepping gpu_expert_layers %d -> 0 to reserve KV+compute+Tier0 headroom\n",
+                    free_mb, params.n_ctx, cfg.gpu_expert_layers);
+                cfg.gpu_expert_layers = 0;
+            } else if (free_mb < 6750 && cfg.gpu_expert_layers > 1) {
+                std::fprintf(stderr, "[ATLAS] VRAM Guard: free=%zu MiB -> clamping gpu_expert_layers %d -> 1\n",
+                    free_mb, cfg.gpu_expert_layers);
+                cfg.gpu_expert_layers = 1;
+            }
+        }
+    }
+#endif
     if (cfg.gpu_expert_layers > 0 && cfg.gpu_expert_layers < 48) {
         std::string layer_alt = "";
-        for (int l = cfg.gpu_expert_layers; l < 48; ++l) {
-            if (!layer_alt.empty()) layer_alt += "|";
-            layer_alt += std::to_string(l);
+        const bool boost_selective = (cfg.boost_mode && cfg.gpu_expert_layers > 2);
+        const int extra_reasoning = boost_selective ? (cfg.gpu_expert_layers - 2) : 0;
+        const int overflow_mid = (boost_selective && 15 + extra_reasoning > 48) ? (15 + extra_reasoning - 48) : 0;
+        for (int l = 0; l < 48; ++l) {
+            bool on_gpu = false;
+            if (boost_selective) {
+                // Layers 0..1 (K=4) + heavy reasoning band 15..47 (K=2..4) go to GPU first;
+                // layers 2..14 are Dynamic-K=1 on CPU (~100us AVX2/AVX-512), only filled if budget exceeds 35 layers.
+                if (l < 2) {
+                    on_gpu = true;
+                } else if (l >= 15 && l < 15 + extra_reasoning) {
+                    on_gpu = true;
+                } else if (overflow_mid > 0 && l >= 2 && l < 2 + overflow_mid) {
+                    on_gpu = true;
+                }
+            } else {
+                on_gpu = (l < cfg.gpu_expert_layers);
+            }
+            if (!on_gpu) {
+                if (!layer_alt.empty()) layer_alt += "|";
+                layer_alt += std::to_string(l);
+            }
         }
         cpu_moe_pattern_storage = "blk\\.(" + layer_alt + ")\\.ffn_(up|down|gate_up|gate)_exps";
         overrides.push_back({cpu_moe_pattern_storage.c_str(), ggml_backend_cpu_buffer_type()});
@@ -3651,10 +4594,10 @@ int main(int argc, char ** argv) {
         params.speculative.ngram_simple.size_m = cfg.mtp_draft_n > 0 ? cfg.mtp_draft_n : 2;
         params.speculative.ngram_simple.min_hits = 1;
         has_spec_type = true;
-        // Limit verification ubatch (d* <= 3 -> nrc=4) to save +335.8 MiB scratch compute VRAM
-        // while strictly satisfying hybrid recurrent rollback assertion: n_ubatch > n_keep_tail (need_n_rs_seq + 1)
+        // Ensure verification ubatch satisfies hybrid recurrent rollback assertion: n_ubatch > n_keep_tail (need_n_rs_seq + 1)
+        // while preserving full vector batching (n_ubatch >= 64) for maximum prefill and verification compute throughput.
         const uint32_t min_safe_ubatch = params.speculative.need_n_rs_seq() + 2;
-        params.n_ubatch = std::max<uint32_t>(min_safe_ubatch, std::min<uint32_t>(params.n_ubatch, std::max<uint32_t>(cfg.mtp_verify_ubatch_limit, min_safe_ubatch)));
+        params.n_ubatch = std::max<uint32_t>(params.n_ubatch, min_safe_ubatch);
     } else if (cfg.enable_tlep) {
         if (cfg.mtp_mode != "off" && !cfg.mtp_path.empty()) {
             params.speculative.types.clear();
@@ -3703,10 +4646,26 @@ int main(int argc, char ** argv) {
             draft_overrides.push_back({nullptr, nullptr});
             params.speculative.draft.tensor_buft_overrides = draft_overrides;
         } else if (cfg.mtp_location == "hybrid" || cfg.mtp_mode == "hybrid") {
-            // Dense on GPU, MoE experts + token_embd in host RAM
+            // Dense on GPU, MoE experts + token_embd (+ output head on <=9 GiB GPUs) in host RAM
             draft_overrides.push_back(llm_ffn_exps_cpu_override());
             draft_overrides.push_back({R"(blk\.48\.ffn_.*_exps)", ggml_backend_cpu_buffer_type()});
             draft_overrides.push_back({R"(token_embd\.weight)", ggml_backend_cpu_buffer_type()});
+            bool place_head_host = (cfg.mtp_vocab_shortlist > 0);
+            if (const char * env_hh = std::getenv("ATLAS_MTP_HOST_HEAD")) {
+                place_head_host = (std::atoi(env_hh) != 0);
+            } else {
+#if defined(GGML_USE_CUDA)
+                size_t fv = 0, tv = 0;
+                ggml_backend_cuda_get_device_memory(0, &fv, &tv);
+                if (tv > 0 && tv <= 9ULL * 1024ULL * 1024ULL * 1024ULL) {
+                    place_head_host = true;
+                }
+#endif
+            }
+            if (place_head_host) {
+                draft_overrides.push_back({R"(output\.weight)", ggml_backend_cpu_buffer_type()});
+                draft_overrides.push_back({R"(.*shared_head_head\.weight)", ggml_backend_cpu_buffer_type()});
+            }
             draft_overrides.push_back({nullptr, nullptr});
             params.speculative.draft.tensor_buft_overrides = draft_overrides;
         } else {
@@ -3734,7 +4693,13 @@ int main(int argc, char ** argv) {
     }
     overrides.push_back({nullptr, nullptr});
     params.tensor_buft_overrides = overrides;
-    params.load_mode = LLAMA_LOAD_MODE_MMAP;
+    if (cfg.load_mode == "direct_io") {
+        params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+    } else if (cfg.load_mode == "auto") {
+        params.load_mode = LLAMA_LOAD_MODE_AUTO;
+    } else {
+        params.load_mode = LLAMA_LOAD_MODE_MMAP;
+    }
 
     atlas::Runtime runtime(cfg);
     params.cb_eval_user_data = &runtime;
@@ -3749,8 +4714,45 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "[DEBUG-DEV] dev %zu: name=%s type=%d\n", i, ggml_backend_dev_name(d), (int)ggml_backend_dev_type(d));
     }
 
+    const bool user_set_gpu_layer_mask_env =
+        (std::getenv("ATLAS_GPU_MOE_LAYER_MASK") != nullptr && std::getenv("ATLAS_GPU_MOE_LAYER_MASK")[0] != '\0');
+    const bool explicit_gpu_moe_env =
+        (std::getenv("ATLAS_GPU_MOE_CACHE") != nullptr && std::string(std::getenv("ATLAS_GPU_MOE_CACHE")) == "1");
+    bool allow_auto_gpu_moe = explicit_gpu_moe_env || user_set_gpu_layer_mask_env || (cfg.vram_layer_cap != 0);
+#if defined(GGML_USE_CUDA)
+    if (!allow_auto_gpu_moe && !cfg.cpu_only && cfg.vram_cache_mb > 0 && !cfg.boost_mode) {
+        size_t pre_free_vram = 0, pre_total_vram = 0;
+        ggml_backend_cuda_get_device_memory(0, &pre_free_vram, &pre_total_vram);
+        if (pre_total_vram > 12ULL * 1024ULL * 1024ULL * 1024ULL) {
+            allow_auto_gpu_moe = true;
+        }
+    }
+#endif
+    if (!user_set_gpu_layer_mask_env) {
+        uint64_t pre_mask = 0ULL;
+        if (!cfg.cpu_only && cfg.vram_cache_mb > 0 && allow_auto_gpu_moe) {
+            if (cfg.vram_layer_cap < 0) {
+                pre_mask = ~0ULL;
+            } else {
+                const int est_slots = std::max(1, int(double(cfg.vram_cache_mb) / 2.25));
+                pre_mask = atlas::compute_recommended_vram_layer_mask(48, est_slots, cfg.vram_layer_cap);
+            }
+        }
+        char mask_buf[32];
+        std::snprintf(mask_buf, sizeof(mask_buf), "0x%" PRIx64, pre_mask);
+#if defined(_WIN32)
+        _putenv_s("ATLAS_GPU_MOE_LAYER_MASK", mask_buf);
+#else
+        setenv("ATLAS_GPU_MOE_LAYER_MASK", mask_buf, 1);
+#endif
+    }
+
     std::fprintf(stderr, "[DEBUG-ATLAS] 1. Before common_init_from_params\n"); std::fflush(stderr);
     auto llama_init_result = common_init_from_params(params);
+    struct HotRamUnlockGuard {
+        atlas::Runtime & rt;
+        ~HotRamUnlockGuard() { rt.unlock_hot_ram(); }
+    } hot_ram_unlock_guard{runtime};
     std::fprintf(stderr, "[DEBUG-ATLAS] 2. After common_init_from_params, res=%p\n", (void*)llama_init_result.get()); std::fflush(stderr);
     llama_model * model = llama_init_result ? llama_init_result->model() : nullptr;
     llama_context * ctx = llama_init_result ? llama_init_result->context() : nullptr;
@@ -3840,6 +4842,432 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Phase 17: Initialize Unified Tier-0 CUDA VRAM + Tier-1 Locked RAM ClassLRU Cache
+    // and run <80ms Startup CPU Quantization Kernel Micro-Benchmark
+    {
+        const int n_model_layers = std::min<int>(atlas::UnifiedTieredExpertCache::MAX_LAYERS, llama_model_n_layer(model));
+        std::vector<atlas::UnifiedTieredExpertCache::LayerMeta> layer_metas(size_t(n_model_layers > 0 ? n_model_layers : 48));
+        size_t max_slot_stride = 0;
+        int host_moe_type = -1;
+        int64_t host_moe_ncols = 0;
+        const auto & tmap = llama_internal_get_tensor_map(model);
+        std::vector<std::vector<std::pair<void *, size_t>>> cpu_moe_layer_spans(layer_metas.size());
+        std::vector<atlas::ZeroCopyHotRamLayer> cpu_moe_layers_for_pin;
+        size_t total_cpu_moe_bytes = 0;
+        for (const auto & kv : tmap) {
+            const std::string & tname = kv.first;
+            struct ggml_tensor * ten = kv.second;
+            if (!ten || !ten->data || !ten->buffer || !ggml_backend_buffer_is_host(ten->buffer)) continue;
+            if (tname.rfind("blk.", 0) != 0) continue;
+            size_t dot2 = tname.find('.', 4);
+            if (dot2 == std::string::npos) continue;
+            int layer = std::atoi(tname.substr(4, dot2 - 4).c_str());
+            if (layer < 0 || layer >= (int)layer_metas.size()) continue;
+            const std::string suffix = tname.substr(dot2 + 1);
+            if (suffix == "ffn_gate_exps.weight") {
+                layer_metas[size_t(layer)].gate_base = static_cast<const uint8_t *>(ten->data);
+                layer_metas[size_t(layer)].gate_expert_bytes = ten->nb[2];
+                layer_metas[size_t(layer)].gate_type = (int32_t)ten->type;
+                layer_metas[size_t(layer)].n_embd = ten->ne[0];
+                layer_metas[size_t(layer)].n_ff = ten->ne[1];
+                if (host_moe_type < 0) { host_moe_type = (int)ten->type; host_moe_ncols = ten->ne[0]; }
+                const size_t nb_ten = ggml_nbytes(ten);
+                cpu_moe_layer_spans[size_t(layer)].push_back({ten->data, nb_ten});
+                total_cpu_moe_bytes += nb_ten;
+            } else if (suffix == "ffn_up_exps.weight") {
+                layer_metas[size_t(layer)].up_base = static_cast<const uint8_t *>(ten->data);
+                layer_metas[size_t(layer)].up_expert_bytes = ten->nb[2];
+                layer_metas[size_t(layer)].up_type = (int32_t)ten->type;
+                const size_t nb_ten = ggml_nbytes(ten);
+                cpu_moe_layer_spans[size_t(layer)].push_back({ten->data, nb_ten});
+                total_cpu_moe_bytes += nb_ten;
+            } else if (suffix == "ffn_down_exps.weight") {
+                layer_metas[size_t(layer)].down_base = static_cast<const uint8_t *>(ten->data);
+                layer_metas[size_t(layer)].down_expert_bytes = ten->nb[2];
+                layer_metas[size_t(layer)].down_type = (int32_t)ten->type;
+                const size_t nb_ten = ggml_nbytes(ten);
+                cpu_moe_layer_spans[size_t(layer)].push_back({ten->data, nb_ten});
+                total_cpu_moe_bytes += nb_ten;
+            } else if (suffix == "ffn_gate_up_exps.weight") {
+                const size_t nb_ten = ggml_nbytes(ten);
+                cpu_moe_layer_spans[size_t(layer)].push_back({ten->data, nb_ten});
+                total_cpu_moe_bytes += nb_ten;
+            }
+        }
+        for (size_t l = 0; l < cpu_moe_layer_spans.size(); ++l) {
+            size_t l_bytes = 0;
+            for (const auto & sp : cpu_moe_layer_spans[l]) {
+                l_bytes += sp.second;
+            }
+            if (l_bytes > 0) {
+                cpu_moe_layers_for_pin.push_back({int(l), l_bytes});
+            }
+        }
+        for (const auto & lm : layer_metas) {
+            max_slot_stride = std::max(max_slot_stride, lm.slot_bytes());
+        }
+
+        // v0.16.3: Three-Regime Zero-Copy Boost-Aware Hot-RAM Pinning & Pre-Warming
+        // 1. Full-fit CPU MoE: MADV_HUGEPAGE + MADV_WILLNEED + mlock/VirtualLock on 100% of CPU MoE layers.
+        // 2. Near-fit CPU MoE (auto): MADV_HUGEPAGE (selected layers only) + MADV_WILLNEED + parallel
+        //    zero-copy page-touch pre-warming into reclaimable Hot RAM (eliminates cold faults without
+        //    starving unpinned layers or triggering kswapd/NVMe thrashing during warm decode).
+        // 3. Heavy NVMe-streaming (>1.5x avail RAM): reclaimed-pagecache mode (GPU shadow eviction only).
+        if (!cpu_moe_layers_for_pin.empty()) {
+            const auto t_hr0 = atlas::clock::now();
+            auto read_avail_ram = []() -> size_t {
+                size_t avail = 0;
+#if defined(__linux__)
+                std::ifstream mi("/proc/meminfo");
+                std::string k; size_t kb = 0; std::string unit;
+                while (mi >> k >> kb >> unit) {
+                    if (k == "MemAvailable:") { avail = kb * 1024ULL; break; }
+                }
+#elif defined(_WIN32)
+                MEMORYSTATUSEX msx{}; msx.dwLength = sizeof(msx);
+                if (GlobalMemoryStatusEx(&msx)) {
+                    avail = size_t(msx.ullAvailPhys);
+                }
+#endif
+                return avail;
+            };
+            const size_t avail_ram_now = read_avail_ram();
+            const auto hr_plan = atlas::compute_zero_copy_hot_ram_plan(
+                cpu_moe_layers_for_pin,
+                n_model_layers,
+                avail_ram_now,
+                size_t(cfg.prompt_cache_mb) * 1024ULL * 1024ULL,
+                params.n_ctx,
+                cfg.ram_lock_policy);
+#if defined(__linux__)
+            const size_t ps = size_t(sysconf(_SC_PAGESIZE));
+            // Advise MADV_HUGEPAGE ONLY on selected hot layers (never on unpinned streaming layers,
+            // where 2 MiB THP causes read amplification under memory pressure).
+            if (!hr_plan.streaming_pagecache_mode && !hr_plan.selected_layers.empty()) {
+                for (int l : hr_plan.selected_layers) {
+                    for (const auto & sp : cpu_moe_layer_spans[size_t(l)]) {
+                        uintptr_t a = reinterpret_cast<uintptr_t>(sp.first) & ~(ps - 1);
+                        size_t len = (reinterpret_cast<uintptr_t>(sp.first) - a) + sp.second;
+                        (void) madvise(reinterpret_cast<void *>(a), len, MADV_HUGEPAGE);
+                    }
+                }
+            }
+#elif defined(_WIN32)
+            SYSTEM_INFO sys_info{};
+            GetSystemInfo(&sys_info);
+            const size_t ps = (sys_info.dwPageSize > 0) ? size_t(sys_info.dwPageSize) : 4096ULL;
+            if (hr_plan.use_mlock && hr_plan.planned_bytes > 0) {
+                // Raise Windows working-set quota so VirtualLock does not fail with ERROR_WORKING_SET_QUOTA
+                const SIZE_T min_ws = SIZE_T(hr_plan.planned_bytes + (512ULL << 20));
+                const SIZE_T max_ws = SIZE_T(hr_plan.planned_bytes + (1536ULL << 20));
+                (void) SetProcessWorkingSetSizeEx(
+                    GetCurrentProcess(),
+                    min_ws,
+                    max_ws,
+                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+#endif
+
+            size_t pinned_layers = 0;
+            size_t warmed_layers = 0;
+            size_t pinned_bytes  = 0;
+            size_t warmed_bytes  = 0;
+            std::atomic<bool> mlock_ok{true};
+            if (!hr_plan.selected_layers.empty()) {
+                // Phase A: Issue asynchronous MADV_WILLNEED across all selected layers so kernel
+                // NVMe readahead saturates full queue depth before faulting/locking.
+#if defined(__linux__)
+                for (int l : hr_plan.selected_layers) {
+                    for (const auto & sp : cpu_moe_layer_spans[size_t(l)]) {
+                        uintptr_t a = reinterpret_cast<uintptr_t>(sp.first) & ~(ps - 1);
+                        size_t len = (reinterpret_cast<uintptr_t>(sp.first) - a) + sp.second;
+                        (void) madvise(reinterpret_cast<void *>(a), len, MADV_WILLNEED);
+                    }
+                }
+#endif
+                // Phase B: Parallel page-fault (and optional mlock/VirtualLock) with atomic in-flight reservation
+                // so concurrent workers never overshoot the OS RAM safety floor.
+                const size_t guard_minus_margin =
+                    (hr_plan.guard_bytes > (256ULL << 20)) ? (hr_plan.guard_bytes - (256ULL << 20)) : 0ULL;
+                const size_t live_floor = std::max<size_t>(size_t(1536ULL) * 1024ULL * 1024ULL, guard_minus_margin);
+                std::atomic<size_t> next_idx{0};
+                std::atomic<bool> stop_pin{false};
+                std::atomic<size_t> in_flight_bytes{0};
+                std::mutex hr_mtx;
+                const size_t n_workers = std::min<size_t>(4, hr_plan.selected_layers.size());
+                std::vector<std::thread> workers;
+                workers.reserve(n_workers);
+                for (size_t w = 0; w < n_workers; ++w) {
+                    workers.emplace_back([&]() {
+                        while (!stop_pin.load(std::memory_order_acquire)) {
+                            const size_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+                            if (idx >= hr_plan.selected_layers.size()) break;
+                            const int l = hr_plan.selected_layers[idx];
+                            size_t layer_total = 0;
+                            for (const auto & sp : cpu_moe_layer_spans[size_t(l)]) {
+                                layer_total += sp.second;
+                            }
+                            const size_t prev_inflight = in_flight_bytes.fetch_add(layer_total, std::memory_order_acq_rel);
+                            const size_t live_avail = read_avail_ram();
+                            if (live_avail > 0 && live_avail < live_floor + prev_inflight) {
+                                in_flight_bytes.fetch_sub(layer_total, std::memory_order_acq_rel);
+                                stop_pin.store(true, std::memory_order_release);
+                                break;
+                            }
+
+                            size_t layer_locked = 0;
+                            size_t layer_warmed = 0;
+                            std::vector<std::pair<void *, size_t>> layer_spans;
+                            auto touch_span = [ps](const std::pair<void *, size_t> & sp) {
+                                volatile uint8_t sink = 0;
+                                const uint8_t * p = static_cast<const uint8_t *>(sp.first);
+                                for (size_t off = 0; off < sp.second; off += ps) {
+                                    sink ^= p[off];
+                                }
+                                (void) sink;
+                            };
+
+                            for (const auto & sp : cpu_moe_layer_spans[size_t(l)]) {
+                                if (hr_plan.use_mlock) {
+#if defined(__linux__)
+                                    uintptr_t a = reinterpret_cast<uintptr_t>(sp.first) & ~(ps - 1);
+                                    size_t len = ((reinterpret_cast<uintptr_t>(sp.first) - a) + sp.second + ps - 1) & ~(ps - 1);
+                                    if (mlock(reinterpret_cast<void *>(a), len) == 0) {
+                                        layer_spans.push_back({reinterpret_cast<void *>(a), len});
+                                        layer_locked += sp.second;
+                                        layer_warmed += sp.second;
+                                    } else {
+                                        mlock_ok.store(false, std::memory_order_relaxed);
+                                        touch_span(sp);
+                                        layer_warmed += sp.second;
+                                    }
+#elif defined(_WIN32)
+                                    if (VirtualLock(sp.first, sp.second) != 0) {
+                                        layer_spans.push_back(sp);
+                                        layer_locked += sp.second;
+                                        layer_warmed += sp.second;
+                                    } else {
+                                        mlock_ok.store(false, std::memory_order_relaxed);
+                                        touch_span(sp);
+                                        layer_warmed += sp.second;
+                                    }
+#endif
+                                } else {
+                                    // Zero-copy pre-warm into reclaimable OS page cache (no mlock starvation)
+                                    touch_span(sp);
+                                    layer_warmed += sp.second;
+                                }
+                            }
+                            in_flight_bytes.fetch_sub(layer_total, std::memory_order_acq_rel);
+                            if (layer_locked > 0 || layer_warmed > 0) {
+                                std::lock_guard<std::mutex> lk(hr_mtx);
+                                if (layer_locked > 0) {
+                                    pinned_layers++;
+                                    pinned_bytes += layer_locked;
+                                    for (const auto & ls : layer_spans) {
+                                        runtime.hot_ram_locked_spans.push_back(ls);
+                                    }
+                                }
+                                if (layer_warmed > 0) {
+                                    warmed_layers++;
+                                    warmed_bytes += layer_warmed;
+                                }
+                            }
+                        }
+                    });
+                }
+                for (auto & th : workers) {
+                    if (th.joinable()) th.join();
+                }
+            }
+            runtime.hot_ram_pinned_bytes = (pinned_bytes > 0) ? pinned_bytes : warmed_bytes;
+            const double hr_ms = std::chrono::duration<double, std::milli>(atlas::clock::now() - t_hr0).count();
+            const char * hr_mode = (pinned_bytes > 0)
+                ? "zero-copy-mlock"
+                : (hr_plan.streaming_pagecache_mode
+                    ? "reclaimed-pagecache"
+                    : (warmed_bytes > 0 ? "zero-copy-prewarm" : (cfg.ram_lock_policy == "off" ? "off" : "mmap")));
+            const size_t report_layers = (pinned_bytes > 0) ? pinned_layers : warmed_layers;
+            std::fprintf(stderr, "[ATLAS-HOTRAM] Zero-Copy Hot-RAM: pinned=%.1f MiB (%zu/%zu CPU MoE layers, total_cpu_moe=%.1f MiB, budget=%.1f MiB, mode=%s, mlock_ok=%s, elapsed=%.1f ms)\n",
+                double(pinned_bytes > 0 ? pinned_bytes : warmed_bytes) / (1024.0 * 1024.0),
+                report_layers,
+                cpu_moe_layers_for_pin.size(),
+                double(total_cpu_moe_bytes) / (1024.0 * 1024.0),
+                double(hr_plan.budget_bytes) / (1024.0 * 1024.0),
+                hr_mode,
+                hr_plan.use_mlock ? (mlock_ok.load(std::memory_order_relaxed) ? "yes" : "partial") : "reclaimable",
+                hr_ms);
+            std::fflush(stderr);
+        }
+
+        if (max_slot_stride > 0) {
+            size_t real_vram_budget = 0;
+#if defined(GGML_USE_CUDA)
+            size_t cur_free_vram = 0, cur_total_vram = 0;
+            ggml_backend_cuda_get_device_memory(0, &cur_free_vram, &cur_total_vram);
+            if (allow_auto_gpu_moe && cur_total_vram > 0 && cur_free_vram > 0) {
+                // Model weights, KV cache, and sched_reserve compute buffers are already allocated;
+                // keep 256 MiB headroom for dynamic CUDA pool spikes and desktop compositor safety.
+                const size_t vram_guard = 256ULL * 1024ULL * 1024ULL;
+                const size_t avail_vram = (cur_free_vram > vram_guard) ? (cur_free_vram - vram_guard) : 0;
+                const size_t req_vram = (cfg.vram_cache_mb > 0) ? (size_t(cfg.vram_cache_mb) * 1024ULL * 1024ULL) : 0;
+                real_vram_budget = std::min(avail_vram, req_vram);
+            }
+#endif
+            size_t real_ram_budget = 0;
+            {
+                size_t total_os_ram = 0;
+                size_t avail_os_ram = 0;
+#if defined(__linux__)
+                std::ifstream mi("/proc/meminfo");
+                std::string k; size_t kb = 0; std::string unit;
+                while (mi >> k >> kb >> unit) {
+                    if (k == "MemTotal:")     total_os_ram = kb * 1024ULL;
+                    if (k == "MemAvailable:") avail_os_ram = kb * 1024ULL;
+                    if (total_os_ram > 0 && avail_os_ram > 0) break;
+                }
+#elif defined(_WIN32)
+                MEMORYSTATUSEX msx{}; msx.dwLength = sizeof(msx);
+                if (GlobalMemoryStatusEx(&msx)) {
+                    total_os_ram = size_t(msx.ullTotalPhys);
+                    avail_os_ram = size_t(msx.ullAvailPhys);
+                }
+#endif
+                const size_t req_ram = (cfg.moe_cache_mib > 0) ? (size_t(cfg.moe_cache_mib) * 1024ULL * 1024ULL) : 0;
+                const size_t model_bytes = model ? size_t(llama_model_size(model)) : 0;
+                const int active_k = model ? llama_model_n_expert_used(model) : (cfg.expert_k > 0 ? cfg.expert_k : 10);
+                // v0.16.3: When Zero-Copy Hot-RAM THP Pinning already locked CPU MoE layers in mmap,
+                // never allocate a duplicate anonymous heap copy (ram_host_base_) that would halve effective RAM.
+                const bool mmap_zero_copy_preferred =
+                    (params.load_mode == LLAMA_LOAD_MODE_MMAP &&
+                     (runtime.hot_ram_pinned_bytes > 0 ||
+                      (cfg.ram_lock_policy == "auto" &&
+                       avail_os_ram < model_bytes + req_ram + (4ULL << 30))));
+                if (!mmap_zero_copy_preferred) {
+                    real_ram_budget = atlas::compute_adaptive_ram_budget(
+                        req_ram,
+                        total_os_ram,
+                        avail_os_ram,
+                        model_bytes,
+                        active_k,
+                        size_t(cfg.prompt_cache_mb) * 1024ULL * 1024ULL,
+                        cfg.ram_lock_policy);
+                }
+            }
+            if (real_vram_budget >= max_slot_stride || real_ram_budget >= max_slot_stride) {
+                runtime.unified_cache.init(real_vram_budget, real_ram_budget, max_slot_stride, 128.0f);
+                uint64_t layer_mask = 0ULL;
+                if (runtime.unified_cache.has_real_vram()) {
+                    if (user_set_gpu_layer_mask_env) {
+                        const char * env_m = std::getenv("ATLAS_GPU_MOE_LAYER_MASK");
+                        layer_mask = env_m ? std::strtoull(env_m, nullptr, 0) : ~0ULL;
+                    } else if (cfg.vram_layer_cap < 0) {
+                        layer_mask = (n_model_layers >= 64) ? ~0ULL : ((1ULL << n_model_layers) - 1ULL);
+                    } else {
+                        layer_mask = atlas::compute_recommended_vram_layer_mask(
+                            n_model_layers, runtime.unified_cache.vram_slots(), cfg.vram_layer_cap);
+                    }
+                }
+                runtime.active_vram_layer_mask = layer_mask;
+                runtime.unified_cache.set_vram_layer_mask(layer_mask);
+                atlas::atlas_set_gpu_layer_mask(layer_mask);
+                {
+                    char mask_buf[32];
+                    std::snprintf(mask_buf, sizeof(mask_buf), "0x%" PRIx64, layer_mask);
+#if defined(_WIN32)
+                    _putenv_s("ATLAS_GPU_MOE_LAYER_MASK", mask_buf);
+#else
+                    setenv("ATLAS_GPU_MOE_LAYER_MASK", mask_buf, 1);
+#endif
+                }
+                for (int l = 0; l < (int)layer_metas.size(); ++l) {
+                    if (layer_metas[size_t(l)].slot_bytes() > 0) {
+                        runtime.unified_cache.register_layer_weights(l, layer_metas[size_t(l)]);
+                    }
+                }
+                runtime.unified_cache.set_ram_callback([&runtime](int l, int e, int /*slot*/, bool admitted) {
+                    if (admitted) {
+                        atlas::atlas_set_ram_expert_ptr(0, l, e, runtime.unified_cache.get_ram_tensor_ptr(l, e, 0));
+                        atlas::atlas_set_ram_expert_ptr(1, l, e, runtime.unified_cache.get_ram_tensor_ptr(l, e, 1));
+                        atlas::atlas_set_ram_expert_ptr(2, l, e, runtime.unified_cache.get_ram_tensor_ptr(l, e, 2));
+                    } else {
+                        atlas::atlas_set_ram_expert_ptr(0, l, e, nullptr);
+                        atlas::atlas_set_ram_expert_ptr(1, l, e, nullptr);
+                        atlas::atlas_set_ram_expert_ptr(2, l, e, nullptr);
+                    }
+                });
+                if (runtime.unified_cache.has_real_ram()) {
+                    atlas::atlas_set_ram_cache_active(1);
+                }
+                int cuda_moe_layers = 0;
+                int masked_cuda_layers = 0;
+#if defined(GGML_USE_CUDA)
+                ggml_backend_cuda_atlas_moe_set_layer_mask(layer_mask);
+                if (runtime.unified_cache.has_real_vram() && layer_mask != 0ULL &&
+                    ggml_backend_cuda_atlas_moe_set_arena(
+                        runtime.unified_cache.vram_dev_base(),
+                        runtime.unified_cache.slot_stride_bytes(),
+                        n_model_layers)) {
+                    for (int l = 0; l < (int)layer_metas.size(); ++l) {
+                        const auto & lm = layer_metas[size_t(l)];
+                        if (lm.slot_bytes() > 0 && lm.gate_type >= 0 && lm.up_type >= 0 && lm.down_type >= 0) {
+                            if (ggml_backend_cuda_atlas_moe_set_layer_meta(
+                                    l, lm.gate_type, lm.up_type, lm.down_type,
+                                    lm.n_embd, lm.n_ff,
+                                    0ULL, lm.up_offset(), lm.down_offset())) {
+                                cuda_moe_layers++;
+                                if (l < 64 && ((layer_mask >> l) & 1ULL) != 0ULL) {
+                                    masked_cuda_layers++;
+                                }
+                            }
+                        }
+                    }
+                    if (masked_cuda_layers > 0) {
+                        runtime.unified_cache.set_vram_callback([](int l, int e, int slot, bool admitted) {
+                            ::atlas_set_expert_gpu_slot(l, e, admitted ? int16_t(slot) : int16_t(-1));
+                        });
+                        atlas::atlas_set_gpu_cache_active(1);
+                        ggml_backend_cuda_atlas_moe_set_active(1);
+                    }
+                }
+#endif
+                std::printf("[ATLAS-P18] Unified ClassLRU Cache: VRAM=%d slots (%.1f MiB, cuda_layers=%d/%d, mask=0x%" PRIx64 "), LockedRAM=%d slots (%.1f MiB, locked=%s, policy=%s), stride=%.2f MiB\n",
+                    runtime.unified_cache.vram_slots(),
+                    double(size_t(runtime.unified_cache.vram_slots()) * max_slot_stride) / (1024.0 * 1024.0),
+                    masked_cuda_layers,
+                    cuda_moe_layers,
+                    layer_mask,
+                    runtime.unified_cache.ram_slots(),
+                    double(size_t(runtime.unified_cache.ram_slots()) * max_slot_stride) / (1024.0 * 1024.0),
+                    runtime.unified_cache.is_ram_locked() ? "yes" : "mmap",
+                    cfg.ram_lock_policy.c_str(),
+                    double(max_slot_stride) / (1024.0 * 1024.0));
+            } else {
+                runtime.active_vram_layer_mask = 0ULL;
+                atlas::atlas_set_gpu_layer_mask(0ULL);
+#if defined(GGML_USE_CUDA)
+                ggml_backend_cuda_atlas_moe_set_layer_mask(0ULL);
+#endif
+#if defined(_WIN32)
+                _putenv_s("ATLAS_GPU_MOE_LAYER_MASK", "0x0");
+#else
+                setenv("ATLAS_GPU_MOE_LAYER_MASK", "0x0", 1);
+#endif
+            }
+        }
+
+        if (cfg.cpu_bench && host_moe_type >= 0 && host_moe_ncols > 0) {
+            const double gbps = atlas::atlas_cpu_bench_quant_kernels(host_moe_type, int(host_moe_ncols), 32);
+            if (gbps > 0.0) {
+                const double expert_gb = double(max_slot_stride > 0 ? max_slot_stride : 1600000ULL) / (1024.0 * 1024.0 * 1024.0);
+                const double est_ms = (expert_gb / gbps) * 1000.0;
+                runtime.cpu_share_ctrl.update_observed_timings(est_ms, 0.90);
+                std::printf("[ATLAS-P17] Startup CPU Quant Bench (type=%s, ncols=%" PRId64 "): %.2f GB/s (est %.2f ms/expert)\n",
+                    ggml_type_name((enum ggml_type)host_moe_type), host_moe_ncols, gbps, est_ms);
+            }
+        }
+    }
+
     const auto rm_type_tgt = spec ? common_context_can_seq_rm(ctx) : COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     const bool use_ckpt_tgt = spec && (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
         (rm_type_tgt == COMMON_CONTEXT_SEQ_RM_TYPE_RS && (int)cfg.mtp_draft_n > (int)llama_n_rs_seq(ctx)));
@@ -3874,20 +5302,20 @@ int main(int argc, char ** argv) {
     llama_seq_id seq_id = 0;
     std::vector<llama_token> prompt_tgt;
 
-    // Warmup graph execution to allocate compute buffers and initialize CUDA pools
+    // Warmup single-token decode graph execution to initialize CUDA pools without prefill page thrashing
     {
-        int warm_batch_size = std::min<int>(32, std::max<int>(1, (int)tokens.size()));
-        std::vector<llama_token> warm_toks(warm_batch_size, llama_vocab_bos(vocab) < 0 ? 0 : llama_vocab_bos(vocab));
-        llama_batch warm_batch = llama_batch_get_one(warm_toks.data(), warm_batch_size);
-        llama_decode(ctx, warm_batch);
-        llama_memory_seq_rm(llama_get_memory(ctx), 0, 0, -1);
-
-        llama_token dummy_tok = warm_toks[0];
+        atlas::atlas_set_all_decode_flags(1);
+        atlas::atlas_reset_decode_step();
+        llama_token dummy_tok = llama_vocab_bos(vocab) < 0 ? 0 : llama_vocab_bos(vocab);
         llama_batch warm_single = llama_batch_get_one(&dummy_tok, 1);
         llama_decode(ctx, warm_single);
         llama_synchronize(ctx);
         llama_memory_clear(llama_get_memory(ctx), true);
         llama_synchronize(ctx);
+        atlas::atlas_set_all_decode_flags(0);
+        atlas::atlas_reset_decode_step();
+        // Flush any warmup candidates cleanly without mutating pre-warmed caches if desired, or reset step
+        atlas::atlas_sync_unified_cache_after_step(runtime, 48, false);
     }
 
     const size_t clean_state_size = llama_state_get_size(ctx);
@@ -3898,12 +5326,11 @@ int main(int argc, char ** argv) {
     }
 
     if (cfg.ipc_mode) {
-        std::printf("[ATLAS_READY]\n");
-        std::fflush(stdout);
-
         struct IpcReq {
             std::string cmd;
             std::string id;
+            std::string session_id;
+            int priority = 2;
             std::string prompt;
             int n_predict = 512;
             int mtp_draft_n = -1; // -1 = default engine config
@@ -3911,16 +5338,62 @@ int main(int argc, char ** argv) {
             float top_p = 0.9f;
             int top_k = 40;
             float min_p = 0.0f;
+            float repeat_penalty = 1.08f;
+            int repeat_last_n = 64;
             std::vector<std::string> stop;
         };
 
         std::mutex mtx;
         std::condition_variable cv;
         std::queue<IpcReq> q;
+        std::unordered_set<std::string> cancelled_ids;
         std::atomic<bool> is_running{true};
         std::atomic<bool> cancel_cur{false};
         std::string active_req_id;
         std::mutex active_id_mtx;
+        std::mutex hb_mtx;
+        std::condition_variable hb_cv;
+
+        llama_set_abort_callback(ctx, atlas_llama_abort_callback, &cancel_cur);
+        ipc_emit({{"event", "ready"}});
+        // Keep literal [ATLAS_READY] marker for server readiness detection
+        {
+            std::lock_guard<std::mutex> lk(g_ipc_stdout_mtx);
+            std::printf("[ATLAS_READY]\n");
+            std::fflush(stdout);
+        }
+
+        std::thread heartbeat([&]() {
+            while (is_running.load()) {
+                std::unique_lock<std::mutex> hlk(hb_mtx);
+                hb_cv.wait_for(hlk, std::chrono::seconds(5), [&]() { return !is_running.load(); });
+                if (!is_running.load()) break;
+                std::string cur_id;
+                {
+                    std::lock_guard<std::mutex> ilk(active_id_mtx);
+                    cur_id = active_req_id;
+                }
+                const int ph = g_ipc_phase.load();
+                const char * phase_str = (ph == 1) ? "prefill" : ((ph == 2) ? "decode" : "idle");
+                int64_t majflt = 0;
+#if !defined(_WIN32)
+                struct rusage ru{};
+                if (getrusage(RUSAGE_SELF, &ru) == 0) {
+                    majflt = (int64_t)ru.ru_majflt;
+                }
+#endif
+                ipc_emit({
+                    {"event", "hb"},
+                    {"id", cur_id},
+                    {"phase", phase_str},
+                    {"prefill_pos", g_ipc_prefill_pos.load()},
+                    {"prefill_total", g_ipc_prefill_total.load()},
+                    {"layer", runtime.last_layer},
+                    {"generated", g_ipc_generated.load()},
+                    {"majflt", majflt}
+                });
+            }
+        });
 
         std::thread reader([&]() {
             std::string line;
@@ -3934,26 +5407,37 @@ int main(int argc, char ** argv) {
                     std::string c = j.value("cmd", "");
                     if (c == "cancel") {
                         std::string cancel_id = j.value("id", "");
-                        std::lock_guard<std::mutex> lk(active_id_mtx);
-                        if (cancel_id.empty() || cancel_id == active_req_id) {
-                            cancel_cur.store(true);
-                            atlas::atlas_set_is_decode(0);
-                            atlas::atlas_reset_decode_step();
+                        {
+                            std::lock_guard<std::mutex> lk(active_id_mtx);
+                            if (cancel_id.empty() || cancel_id == active_req_id) {
+                                cancel_cur.store(true);
+                                atlas::atlas_set_all_decode_flags(0);
+                                atlas::atlas_reset_decode_step();
+                            }
+                        }
+                        if (!cancel_id.empty()) {
+                            std::lock_guard<std::mutex> lk(mtx);
+                            cancelled_ids.insert(cancel_id);
                         }
                     } else if (c == "exit") {
                         is_running.store(false);
+                        hb_cv.notify_all();
                         cv.notify_all();
                         break;
                     } else if (c == "generate") {
                         IpcReq r;
                         r.cmd = "generate";
                         r.id = j.value("id", "");
+                        r.session_id = j.value("session_id", "");
+                        r.priority = j.value("priority", 2);
                         r.prompt = j.value("prompt", "");
                         r.n_predict = j.value("n_predict", 512);
                         r.temp = j.value("temp", 0.7f);
                         r.top_p = j.value("top_p", 0.9f);
                         r.top_k = j.value("top_k", 40);
                         r.min_p = j.value("min_p", 0.0f);
+                        r.repeat_penalty = j.value("repeat_penalty", 1.08f);
+                        r.repeat_last_n = j.value("repeat_last_n", 64);
                         r.mtp_draft_n = j.value("mtp_draft_n", -1);
                         if (j.contains("stop") && j["stop"].is_array()) {
                             for (const auto & s : j["stop"]) {
@@ -3973,13 +5457,8 @@ int main(int argc, char ** argv) {
         });
 
         std::mt19937 rng(1337);
-        std::vector<llama_token> cached_prompt;
-        std::vector<uint8_t> cached_state;
-        std::vector<float> cached_logits;
-        std::vector<uint8_t> cached_spec_state;
-        std::vector<llama_token> stable_prompt;
-        std::vector<uint8_t> stable_state;
-        std::vector<uint8_t> stable_spec_state;
+        PrefixCache prefix_cache;
+        prefix_cache.budget_bytes = (cfg.prompt_cache_mb > 0) ? size_t(cfg.prompt_cache_mb) * 1024ULL * 1024ULL : 0ULL;
 
         while (is_running.load()) {
             IpcReq r;
@@ -3992,14 +5471,34 @@ int main(int argc, char ** argv) {
             }
 
             {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (cancelled_ids.count(r.id)) {
+                    cancelled_ids.erase(r.id);
+                    nlohmann::json done_ev = {
+                        {"event", "done"},
+                        {"id", r.id},
+                        {"finish_reason", "cancelled"},
+                        {"prompt_tokens", 0},
+                        {"completion_tokens", 0}
+                    };
+                    ipc_emit(done_ev);
+                    continue;
+                }
+            }
+
+            {
                 std::lock_guard<std::mutex> lk(active_id_mtx);
                 active_req_id = r.id;
             }
             cancel_cur.store(false);
+            g_ipc_phase.store(1);
+            g_ipc_prefill_pos.store(0);
+            g_ipc_prefill_total.store(0);
+            g_ipc_generated.store(0);
             const auto request_start = atlas::clock::now();
             runtime.saw_decode = false;
             runtime.tokens_decoded = 0;
-            atlas::atlas_set_is_decode(0);
+            atlas::atlas_set_all_decode_flags(0);
             atlas::atlas_reset_decode_step();
             runtime.last_moe_cb_layer = -1;
             runtime.last_layer = -1;
@@ -4033,8 +5532,8 @@ int main(int argc, char ** argv) {
                     {"id", r.id},
                     {"message", "Empty prompt after tokenization"}
                 };
-                std::printf("%s\n", json_dump_safe(err_res).c_str());
-                std::fflush(stdout);
+                ipc_emit(err_res);
+                g_ipc_phase.store(0);
                 {
                     std::lock_guard<std::mutex> lk(active_id_mtx);
                     active_req_id.clear();
@@ -4047,50 +5546,50 @@ int main(int argc, char ** argv) {
                 nlohmann::json err_res = {
                     {"event", "error"},
                     {"id", r.id},
-                    {"message", "Prompt length exceeds context window size"}
+                    {"code", "context_overflow"},
+                    {"prompt_tokens", (int)req_tokens.size()},
+                    {"n_ctx", n_ctx_total},
+                    {"message", "prompt is too long: " + std::to_string(req_tokens.size()) + " tokens > " + std::to_string(n_ctx_total) + " maximum"}
                 };
-                std::printf("%s\n", json_dump_safe(err_res).c_str());
-                std::fflush(stdout);
+                ipc_emit(err_res);
+                g_ipc_phase.store(0);
                 {
                     std::lock_guard<std::mutex> lk(active_id_mtx);
                     active_req_id.clear();
                 }
                 continue;
             }
+            if (r.n_predict <= 0) {
+                const char * cs_env = std::getenv("TENDOU_CONTEXT_SHIFT");
+                const bool enable_ctx_shift = (cs_env != nullptr && std::string(cs_env) == "1");
+                const int remaining_ctx = std::max(1, n_ctx_total - (int)req_tokens.size());
+                r.n_predict = enable_ctx_shift ? 1000000 : remaining_ctx;
+            }
 
             size_t reused_tokens = 0;
-            if (cfg.prompt_cache_mb > 0 && req_tokens.size() >= 16) {
+            std::string prefix_fork_kind = "cold";
+            std::vector<float> restored_logits;
+            if (prefix_cache.budget_bytes > 0 && req_tokens.size() >= 16) {
                 const bool can_reuse_full_prompt = (!spec || r.temp <= 0.01f);
-                const bool cached_matches = !cached_state.empty() && !cached_logits.empty() &&
-                    (can_reuse_full_prompt ? (cached_prompt.size() <= req_tokens.size()) : (cached_prompt.size() < req_tokens.size())) &&
-                    std::equal(cached_prompt.begin(), cached_prompt.end(), req_tokens.begin());
-                const bool stable_matches = !stable_state.empty() && stable_prompt.size() < req_tokens.size() &&
-                    std::equal(stable_prompt.begin(), stable_prompt.end(), req_tokens.begin());
-
-                if (cached_matches && (!stable_matches || cached_prompt.size() >= stable_prompt.size())) {
-                    if (llama_state_set_data(ctx, cached_state.data(), cached_state.size()) == cached_state.size()) {
-                        reused_tokens = cached_prompt.size();
-                        if (spec && !cached_spec_state.empty()) {
-                            common_speculative_set_state(spec.get(), 0, cached_spec_state);
+                while (true) {
+                    const char * fk = "cold";
+                    const int match_idx = prefix_cache.find_best(req_tokens, can_reuse_full_prompt, r.session_id, &fk);
+                    if (match_idx < 0) break;
+                    auto & slot = prefix_cache.slots[match_idx];
+                    if (llama_state_set_data(ctx, slot.state.data(), slot.state.size()) == slot.state.size()) {
+                        reused_tokens = slot.tokens.size();
+                        prefix_fork_kind = fk ? fk : "turn_boundary";
+                        if (reused_tokens == req_tokens.size() && !slot.logits.empty()) {
+                            restored_logits = slot.logits;
                         }
-                        atlas::atlas_reset_decode_step();
-                    } else {
-                        cached_prompt.clear();
-                        cached_state.clear();
-                        cached_spec_state.clear();
-                    }
-                }
-                if (reused_tokens == 0 && stable_matches) {
-                    if (llama_state_set_data(ctx, stable_state.data(), stable_state.size()) == stable_state.size()) {
-                        reused_tokens = stable_prompt.size();
-                        if (spec && !stable_spec_state.empty()) {
-                            common_speculative_set_state(spec.get(), 0, stable_spec_state);
+                        if (spec && !slot.spec_state.empty()) {
+                            common_speculative_set_state(spec.get(), 0, slot.spec_state);
                         }
+                        prefix_cache.touch(match_idx);
                         atlas::atlas_reset_decode_step();
+                        break;
                     } else {
-                        stable_prompt.clear();
-                        std::vector<uint8_t>().swap(stable_state);
-                        stable_spec_state.clear();
+                        prefix_cache.erase(match_idx);
                     }
                 }
             }
@@ -4127,6 +5626,7 @@ int main(int argc, char ** argv) {
 
             // Chunked prompt decode (respecting llama_n_batch and early cancellation)
             const int n_batch = llama_n_batch(ctx);
+            size_t root_end = 0;
             size_t stable_end = 0;
             const size_t assistant_start = r.prompt.rfind("<|im_start|>assistant");
             if (cfg.prompt_cache_mb > 0 && req_tokens.size() >= 16 && assistant_start != std::string::npos) {
@@ -4136,19 +5636,73 @@ int main(int argc, char ** argv) {
                 // Reuse an existing batch boundary; do not add another MoE pass for short prompts.
                 stable_end = stable_end / size_t(n_batch) * size_t(n_batch);
             }
+            // Phase 18: Shared root system/tools anchor before first <|im_start|>user for multi-agent KV Tree Forking
+            if (cfg.prompt_cache_mb > 0 && req_tokens.size() >= 256) {
+                const size_t first_user = r.prompt.find("<|im_start|>user");
+                if (first_user != std::string::npos && first_user > 0) {
+                    const auto sys_prefix = common_tokenize(ctx, r.prompt.substr(0, first_user), add_bos, true);
+                    while (root_end < sys_prefix.size() && root_end < n_prefill_tokens &&
+                           sys_prefix[root_end] == req_tokens[root_end]) ++root_end;
+                    if (root_end < 128 || root_end >= n_prefill_tokens) {
+                        root_end = 0;
+                    }
+                }
+            }
             bool prompt_ok = true;
             double checkpoint_ms = 0.0;
             const auto metrics_before = runtime.memory_manager.get_metrics();
             const auto t_prefill_loop_start = atlas::clock::now();
             double prefill_eval_ms = 0.0;
+            const int n_prefill_work = (n_prefill_tokens > reused_tokens) ? int(n_prefill_tokens - reused_tokens) : 0;
+            g_ipc_prefill_total.store(n_prefill_work);
+            g_ipc_prefill_pos.store(0);
 
             llama_batch p_batch = llama_batch_init(n_batch, 0, 1);
+
+            // Phase 16 Breakthrough: Layer-Wise Single-Pass Prefill for Large Prompts (threshold >= 64)
+            if (runtime.enable_layer_wise_prefill && (n_prefill_tokens - reused_tokens) >= runtime.l_prefill_threshold) {
+                std::fprintf(stderr, "[ATLAS-P16] Engaging Layer-Wise Single-Pass Prefill Engine (%zu tokens, threshold %zu)...\n",
+                             n_prefill_tokens - reused_tokens, runtime.l_prefill_threshold);
+                const auto t_lpf_start = atlas::clock::now();
+                std::vector<llama_token> lpf_stable_prompt;
+                std::vector<uint8_t> lpf_stable_state;
+                std::vector<uint8_t> lpf_stable_spec_state;
+                bool lpf_ok = runtime.execute_layer_wise_single_pass_prefill(
+                    ctx, req_tokens, reused_tokens,
+                    spec.get(), stable_end, &lpf_stable_prompt, &lpf_stable_state, &lpf_stable_spec_state,
+                    prefix_cache.budget_bytes,
+                    r.id,
+                    &cancel_cur);
+                if (lpf_ok) {
+                    if (!lpf_stable_prompt.empty() && !lpf_stable_state.empty()) {
+                        prefix_cache.store(
+                            std::move(lpf_stable_prompt),
+                            std::move(lpf_stable_state),
+                            {},
+                            std::move(lpf_stable_spec_state),
+                            true);
+                    }
+                    prefill_eval_ms = atlas::elapsed_ms(t_lpf_start, atlas::clock::now());
+                    prompt_ok = true;
+                    std::fprintf(stderr, "[ATLAS-P16] Single-Pass Prefill SUCCESS: %.2f ms (%.2f TPS)\n",
+                                 prefill_eval_ms, (double)(n_prefill_tokens - reused_tokens) / (prefill_eval_ms / 1000.0));
+                    goto prefill_finished;
+                }
+                if (cancel_cur.load()) {
+                    prompt_ok = false;
+                    goto prefill_finished;
+                }
+            }
+
             for (int i = (int)reused_tokens; i < (int)n_prefill_tokens;) {
                 if (cancel_cur.load()) {
                     prompt_ok = false;
                     break;
                 }
                 int n_eval = std::min(n_batch, (int)n_prefill_tokens - i);
+                if (root_end > 0 && size_t(i) < root_end) {
+                    n_eval = std::min(n_eval, int(root_end) - i);
+                }
                 if (size_t(i) < stable_end) {
                     n_eval = std::min(n_eval, int(stable_end) - i);
                 }
@@ -4158,7 +5712,7 @@ int main(int argc, char ** argv) {
                 }
                 const auto t_chunk_eval0 = atlas::clock::now();
                 const int decode_ret = llama_decode(ctx, p_batch);
-                if (decode_ret != 0) {
+                if (decode_ret != 0 || cancel_cur.load()) {
                     prompt_ok = false;
                     break;
                 }
@@ -4170,48 +5724,85 @@ int main(int argc, char ** argv) {
                 }
                 prefill_eval_ms += atlas::elapsed_ms(t_chunk_eval0, atlas::clock::now());
                 i += n_eval;
+                g_ipc_prefill_pos.store(i - (int)reused_tokens);
 
-                // Chat history omits the final thinking prefix. Keep a checkpoint before it.
-                if (stable_end >= 16 && size_t(i) == stable_end) {
-                    stable_prompt.clear();
-                    std::vector<uint8_t>().swap(stable_state);
-                    stable_spec_state.clear();
-                    const auto t_cp = atlas::clock::now();
+                // In IPC mode, emit prefill progress ping so server and client watchdog are kept alive
+                nlohmann::json ping_ev = {
+                    {"event", "ping"},
+                    {"id", r.id},
+                    {"progress", i},
+                    {"total", (int)n_prefill_tokens}
+                };
+                ipc_emit(ping_ev);
+
+                // Phase 18: Capture protected shared root anchor (system prompt + tools) for multi-agent KV Tree Forking.
+                if (prefix_cache.budget_bytes > 0 && root_end >= 128 && size_t(i) == root_end) {
+                    const auto t_cp_root = atlas::clock::now();
                     const size_t size = llama_state_get_size(ctx);
-                    if (size > 0 && size <= cfg.prompt_cache_mb * 1024 * 1024 / 2) {
-                        cached_prompt.clear();
-                        std::vector<uint8_t>().swap(cached_state);
-                        cached_logits.clear();
-                        cached_spec_state.clear();
+                    if (size > 0 && size <= prefix_cache.budget_bytes) {
                         try {
-                            stable_state.resize(size);
-                            if (llama_state_get_data(ctx, stable_state.data(), size) == size) {
-                                stable_prompt.assign(req_tokens.begin(), req_tokens.begin() + stable_end);
+                            std::vector<uint8_t> r_state(size);
+                            if (llama_state_get_data(ctx, r_state.data(), size) == size) {
+                                std::vector<llama_token> r_prompt(req_tokens.begin(), req_tokens.begin() + root_end);
+                                std::vector<uint8_t> r_spec;
                                 if (spec) {
-                                    common_speculative_get_state(spec.get(), 0, stable_spec_state);
+                                    common_speculative_get_state(spec.get(), 0, r_spec);
                                 }
-                            } else {
-                                std::vector<uint8_t>().swap(stable_state);
+                                prefix_cache.store(std::move(r_prompt), std::move(r_state), {}, std::move(r_spec), true, true, r.session_id);
                             }
                         } catch (const std::bad_alloc &) {
-                            stable_prompt.clear();
-                            std::vector<uint8_t>().swap(stable_state);
-                            stable_spec_state.clear();
+                        }
+                    }
+                    checkpoint_ms += atlas::elapsed_ms(t_cp_root, atlas::clock::now());
+                }
+
+                // Chat history omits the final thinking prefix. Keep a checkpoint before it.
+                if (prefix_cache.budget_bytes > 0 && stable_end >= 16 && size_t(i) == stable_end && stable_end != root_end) {
+                    const auto t_cp = atlas::clock::now();
+                    const size_t size = llama_state_get_size(ctx);
+                    if (size > 0 && size <= prefix_cache.budget_bytes) {
+                        try {
+                            std::vector<uint8_t> s_state(size);
+                            if (llama_state_get_data(ctx, s_state.data(), size) == size) {
+                                std::vector<llama_token> s_prompt(req_tokens.begin(), req_tokens.begin() + stable_end);
+                                std::vector<uint8_t> s_spec;
+                                if (spec) {
+                                    common_speculative_get_state(spec.get(), 0, s_spec);
+                                }
+                                prefix_cache.store(std::move(s_prompt), std::move(s_state), {}, std::move(s_spec), true, false, r.session_id);
+                            }
+                        } catch (const std::bad_alloc &) {
                         }
                     }
                     checkpoint_ms += atlas::elapsed_ms(t_cp, atlas::clock::now());
                 }
             }
+prefill_finished:;
+            for (int l = 0; l < 48; ++l) {
+                atlas::atlas_set_entropy_k(l, 0);
+            }
             llama_batch_free(p_batch);
 
             if (!prompt_ok) {
+                const bool was_cancelled = cancel_cur.load();
+                llama_synchronize(ctx);
+                llama_memory_clear(llama_get_memory(ctx), false);
+                llama_synchronize(ctx);
+                if (ctx_dft) {
+                    llama_synchronize(ctx_dft);
+                    llama_memory_clear(llama_get_memory(ctx_dft), false);
+                    llama_synchronize(ctx_dft);
+                }
                 nlohmann::json err_res = {
                     {"event", "error"},
                     {"id", r.id},
-                    {"message", cancel_cur.load() ? "Cancelled during prefill" : "Prompt decode failed"}
+                    {"code", was_cancelled ? "cancelled" : "decode_error"},
+                    {"message", was_cancelled ? "Cancelled during prefill" : "Prompt decode failed"}
                 };
-                std::printf("%s\n", json_dump_safe(err_res).c_str());
-                std::fflush(stdout);
+                ipc_emit(err_res);
+                g_ipc_phase.store(0);
+                g_ipc_prefill_pos.store(0);
+                g_ipc_prefill_total.store(0);
                 {
                     std::lock_guard<std::mutex> lk(active_id_mtx);
                     active_req_id.clear();
@@ -4233,40 +5824,29 @@ int main(int argc, char ** argv) {
             std::memset(runtime.current_token_layer_page_bytes, 0, sizeof(runtime.current_token_layer_page_bytes));
             // Save the complete prefill state (KV + spec pending_h) for multi-turn cache reuse.
             // Both spec and non-spec paths benefit: spec mode skips full prefill on cache hit.
-            if (cfg.prompt_cache_mb > 0 && req_tokens.size() >= 16 && reused_tokens != req_tokens.size()) {
+            if (prefix_cache.budget_bytes > 0 && req_tokens.size() >= 16 && reused_tokens != req_tokens.size()) {
                 const auto t_cp2 = atlas::clock::now();
                 const size_t state_size = llama_state_get_size(ctx);
-                const size_t logits_bytes = size_t(llama_vocab_n_tokens(vocab)) * sizeof(float);
-                if (state_size > 0 && state_size + logits_bytes + stable_state.capacity() <= cfg.prompt_cache_mb * 1024 * 1024) {
+                const size_t n_vocab = size_t(llama_vocab_n_tokens(vocab));
+                const size_t logits_bytes = n_vocab * sizeof(float);
+                if (state_size > 0 && state_size + logits_bytes <= prefix_cache.budget_bytes) {
                     try {
-                        cached_prompt.clear();
                         // This fork serializes memory only, despite the public header's logits comment.
+                        std::vector<float> c_logits;
                         const float * prompt_logits = llama_get_logits_ith(ctx, -1);
                         if (!prompt_logits) prompt_logits = llama_get_logits(ctx);
                         if (prompt_logits) {
-                            cached_logits.assign(prompt_logits, prompt_logits + llama_vocab_n_tokens(vocab));
+                            c_logits.assign(prompt_logits, prompt_logits + n_vocab);
                         }
-                        if (cached_state.capacity() < state_size) {
-                            std::vector<uint8_t>().swap(cached_state);
-                            cached_state.reserve(state_size);
-                        }
-                        cached_state.resize(state_size);
-                        if (llama_state_get_data(ctx, cached_state.data(), state_size) == state_size) {
-                            cached_prompt = req_tokens;
-                            // Also save the speculative hidden state (pending_h) so next turn can
-                            // restore the MTP draft head without re-processing the prompt.
-                            cached_spec_state.clear();
+                        std::vector<uint8_t> c_state(state_size);
+                        if (llama_state_get_data(ctx, c_state.data(), state_size) == state_size) {
+                            std::vector<uint8_t> c_spec;
                             if (spec) {
-                                common_speculative_get_state(spec.get(), 0, cached_spec_state);
+                                common_speculative_get_state(spec.get(), 0, c_spec);
                             }
-                        } else {
-                            cached_state.clear();
-                            cached_spec_state.clear();
+                            prefix_cache.store(req_tokens, std::move(c_state), std::move(c_logits), std::move(c_spec), false, false, r.session_id);
                         }
                     } catch (const std::bad_alloc &) {
-                        cached_prompt.clear();
-                        std::vector<uint8_t>().swap(cached_state);
-                        cached_spec_state.clear();
                     }
                 }
                 checkpoint_ms += atlas::elapsed_ms(t_cp2, atlas::clock::now());
@@ -4297,7 +5877,10 @@ int main(int argc, char ** argv) {
 
             runtime.last_moe_cb_layer = -1;
             runtime.tokens_decoded = 0;
-            atlas::atlas_set_is_decode(1);
+            g_ipc_phase.store(2);
+            g_ipc_prefill_pos.store(g_ipc_prefill_total.load());
+            atlas::atlas_sync_unified_cache_after_step(runtime, 48, true);
+            atlas::atlas_set_all_decode_flags(1);
             atlas::atlas_reset_decode_step();
 
             double ttft_ms = 0.0;
@@ -4312,8 +5895,11 @@ int main(int argc, char ** argv) {
 
             uint64_t req_drafted = 0;
             uint64_t req_accepted = 0;
+            uint64_t req_verify_steps = 0;
+            uint64_t req_verify_batch_sum = 0;
             double req_draft_ms = 0.0;
             double req_verify_ms = 0.0;
+            IpcTokenEmitter<decltype(ipc_emit)> token_emitter(r.id, r.stop, ipc_emit);
 
             if (spec) {
                 common_speculative_begin(spec.get(), 0, prompt_tgt);
@@ -4330,16 +5916,20 @@ int main(int argc, char ** argv) {
                 sparams.min_p = (r.temp <= 0.01f) ? 0.0f : r.min_p;
                 if (r.temp <= 0.01f) {
                     sparams.penalty_repeat = 1.0f;
+                    sparams.penalty_last_n = 0;
                     sparams.penalty_freq = 0.0f;
                     sparams.penalty_present = 0.0f;
                     sparams.dry_multiplier = 0.0f;
                     sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+                } else {
+                    sparams.penalty_repeat = std::max(1.0f, r.repeat_penalty);
+                    sparams.penalty_last_n = std::max(0, r.repeat_last_n);
                 }
                 common_sampler_ptr smpl(common_sampler_init(model, sparams));
 
                 // Emit Token 1 immediately from prefill logits to eliminate the speculative TTFT lag
-                float * logits = (generated == 0 && reused_tokens == req_tokens.size() && !cached_logits.empty())
-                    ? cached_logits.data() : llama_get_logits_ith(ctx, -1);
+                float * logits = (generated == 0 && reused_tokens == req_tokens.size() && !restored_logits.empty())
+                    ? restored_logits.data() : llama_get_logits_ith(ctx, -1);
                 if (!logits) logits = llama_get_logits(ctx);
                 llama_token tok1 = 0;
                 if (r.temp <= 0.01f) {
@@ -4354,27 +5944,19 @@ int main(int argc, char ** argv) {
                 common_sampler_accept(smpl.get(), tok1, true);
 
                 std::string piece = common_token_to_piece(ctx, tok1);
-                full_response += piece;
                 if (ttft_ms == 0.0) ttft_ms = atlas::elapsed_ms(request_start, atlas::clock::now());
                 ++generated;
+                g_ipc_generated.store(generated);
                 session_tokens.push_back(tok1);
                 runtime.quality_estimator.record_token(tok1);
 
-                nlohmann::json tok_event = {
-                    {"event", "token"},
-                    {"id", r.id},
-                    {"token", piece},
-                    {"token_id", (int)tok1}
-                };
-                std::printf("%s\n", json_dump_safe(tok_event).c_str());
-                std::fflush(stdout);
-
                 bool early_stop = false;
-                if (tok1 == eos || llama_vocab_is_eog(vocab, tok1)) {
+                if (token_emitter.push(tok1, piece, (tok1 == eos || llama_vocab_is_eog(vocab, tok1)), full_response)) {
                     finish_reason = "stop";
                     early_stop = true;
                 }
                 if (!early_stop && generated >= r.n_predict) {
+                    token_emitter.flush();
                     finish_reason = "length";
                     early_stop = true;
                 }
@@ -4398,7 +5980,16 @@ int main(int argc, char ** argv) {
                             finish_reason = "cancelled";
                             break;
                         }
+                        if (generated % 16 == 0) {
+                            runtime.memory_manager.sync_context_progress(n_past, n_ctx_total, 16384);
+                        }
                         if (n_past + runtime.current_draft_n >= n_ctx_total) {
+                            const char * cs_env = std::getenv("TENDOU_CONTEXT_SHIFT");
+                            const bool enable_ctx_shift = (cs_env != nullptr && std::string(cs_env) == "1");
+                            if (!enable_ctx_shift) {
+                                finish_reason = "length";
+                                break;
+                            }
                             const int n_keep = std::min(64, n_ctx_total / 8);
                             const int n_discard = std::min(1024, std::max(16, n_ctx_total / 4));
                             llama_memory_seq_rm(llama_get_memory(ctx), 0, n_keep, n_keep + n_discard);
@@ -4540,12 +6131,15 @@ int main(int argc, char ** argv) {
                     for (auto tok : draft) runtime.current_batch_tokens.push_back(tok);
 
                     const auto t_v0 = atlas::clock::now();
-                    if (llama_decode(ctx, batch_tgt) != 0) {
-                        finish_reason = "error";
+                    if (llama_decode(ctx, batch_tgt) != 0 || cancel_cur.load()) {
+                        finish_reason = cancel_cur.load() ? "cancelled" : "error";
                         break;
                     }
+                    atlas::atlas_sync_unified_cache_after_step(runtime, 48, true);
                     const double verify_ms = atlas::elapsed_ms(t_v0, atlas::clock::now());
                     req_verify_ms += verify_ms;
+                    req_verify_steps++;
+                    req_verify_batch_sum += uint64_t(batch_tgt.n_tokens);
                     if (cfg.enable_tlep) {
                         int64_t v_us = static_cast<int64_t>(verify_ms * 1000.0);
                         runtime.slack_estimator.record_verification(v_us, (int)draft.size());
@@ -4554,7 +6148,7 @@ int main(int argc, char ** argv) {
                     }
 
                     if (!common_speculative_process(spec.get(), batch_tgt)) {
-                        finish_reason = "error";
+                        finish_reason = cancel_cur.load() ? "cancelled" : "error";
                         break;
                     }
 
@@ -4620,7 +6214,6 @@ int main(int argc, char ** argv) {
                         runtime.quality_estimator.record_token(id_last);
 
                         std::string piece = common_token_to_piece(ctx, id_last);
-                        full_response += piece;
                         if (ttft_ms == 0.0) ttft_ms = atlas::elapsed_ms(request_start, atlas::clock::now());
 
                         runtime.finish_token_timeline(generated, verify_ms / ids.size(), 0.1, 0.0);
@@ -4628,36 +6221,15 @@ int main(int argc, char ** argv) {
                             runtime.execute_gpu_first_token(generated, runtime.last_layer_experts);
                         }
 
-                        if (id_last == eos || llama_vocab_is_eog(vocab, id_last)) {
-                            finish_reason = "stop";
-                            should_stop = true;
-                            break;
-                        }
-
-                        nlohmann::json tok_event = {
-                            {"event", "token"},
-                            {"id", r.id},
-                            {"token", piece},
-                            {"token_id", (int)id_last}
-                        };
-                        std::printf("%s\n", json_dump_safe(tok_event).c_str());
-                        std::fflush(stdout);
-
-                        bool matched_stop = false;
-                        for (const auto & s : r.stop) {
-                            if (!s.empty() && full_response.size() >= s.size() &&
-                                full_response.compare(full_response.size() - s.size(), s.size(), s) == 0) {
-                                matched_stop = true;
-                                break;
-                            }
-                        }
-                        if (matched_stop) {
+                        g_ipc_generated.store(generated);
+                        if (token_emitter.push(id_last, piece, (id_last == eos || llama_vocab_is_eog(vocab, id_last)), full_response)) {
                             finish_reason = "stop";
                             should_stop = true;
                             break;
                         }
 
                         if (generated >= r.n_predict) {
+                            token_emitter.flush();
                             finish_reason = "length";
                             should_stop = true;
                             break;
@@ -4691,13 +6263,26 @@ int main(int argc, char ** argv) {
                 m.spec_draft_time_ms += req_draft_ms;
                 m.spec_verify_time_ms += req_verify_ms;
             } else {
+                std::vector<llama_token> recent_gen;
+                std::vector<std::pair<float, int>> cand;
+                const int max_recent = std::max(0, r.repeat_last_n);
+                recent_gen.reserve(size_t(std::min(max_recent > 0 ? max_recent : 64, 512)));
                 while (generated < r.n_predict) {
                     if (cancel_cur.load()) {
                         finish_reason = "cancelled";
                         break;
                     }
                     int cur_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+                    if (generated % 16 == 0) {
+                        runtime.memory_manager.sync_context_progress(cur_pos_max, n_ctx_total, 16384);
+                    }
                     if (cur_pos_max + 1 >= n_ctx_total) {
+                        const char * cs_env = std::getenv("TENDOU_CONTEXT_SHIFT");
+                        const bool enable_ctx_shift = (cs_env != nullptr && std::string(cs_env) == "1");
+                        if (!enable_ctx_shift) {
+                            finish_reason = "length";
+                            break;
+                        }
                         const int n_keep = std::min(64, n_ctx_total / 8);
                         const int n_discard = std::min(1024, std::max(16, n_ctx_total / 4));
                         llama_memory_seq_rm(llama_get_memory(ctx), 0, n_keep, n_keep + n_discard);
@@ -4713,8 +6298,8 @@ int main(int argc, char ** argv) {
                         }
                     }
 
-                    float * logits = (generated == 0 && reused_tokens == req_tokens.size() && !cached_logits.empty())
-                        ? cached_logits.data() : llama_get_logits_ith(ctx, -1);
+                    float * logits = (generated == 0 && reused_tokens == req_tokens.size() && !restored_logits.empty())
+                        ? restored_logits.data() : llama_get_logits_ith(ctx, -1);
                     if (!logits) logits = llama_get_logits(ctx);
                     if (!logits) {
                         finish_reason = "error";
@@ -4742,32 +6327,61 @@ int main(int argc, char ** argv) {
                         }
                         tok = static_cast<llama_token>(best);
                     } else {
-                        float max_l = logits[0];
-                        for (int i = 1; i < vocab_size; ++i) if (logits[i] > max_l) max_l = logits[i];
-
-                        std::vector<std::pair<float, int>> probs;
-                        probs.reserve(vocab_size);
-                        float sum = 0.0f;
+                        cand.clear();
+                        cand.reserve(size_t(vocab_size));
                         for (int i = 0; i < vocab_size; ++i) {
-                            float p = std::exp((logits[i] - max_l) / r.temp);
-                            probs.push_back({p, i});
-                            sum += p;
+                            cand.push_back({logits[i], i});
                         }
-                        for (auto & p : probs) p.first /= sum;
 
-                        std::sort(probs.begin(), probs.end(), [](const auto & a, const auto & b) {
+                        if (r.repeat_penalty > 1.0f && max_recent > 0 && !recent_gen.empty()) {
+                            const size_t n_rec = recent_gen.size();
+                            const size_t start_rec = (n_rec > size_t(max_recent)) ? (n_rec - size_t(max_recent)) : 0;
+                            llama_token seen_rep[128];
+                            size_t n_seen_rep = 0;
+                            for (size_t ri = start_rec; ri < n_rec; ++ri) {
+                                const llama_token rt = recent_gen[ri];
+                                if (rt < 0 || rt >= vocab_size || rt == eos || llama_vocab_is_eog(vocab, rt)) continue;
+                                bool dup = false;
+                                for (size_t sj = 0; sj < n_seen_rep; ++sj) {
+                                    if (seen_rep[sj] == rt) { dup = true; break; }
+                                }
+                                if (dup) continue;
+                                if (n_seen_rep < 128) seen_rep[n_seen_rep++] = rt;
+                                float & lv = cand[size_t(rt)].first;
+                                lv = (lv > 0.0f) ? (lv / r.repeat_penalty) : (lv * r.repeat_penalty);
+                            }
+                        }
+
+                        const int eff_top_k = (r.top_k > 0) ? r.top_k : 40;
+                        if (eff_top_k > 0 && eff_top_k < vocab_size) {
+                            std::nth_element(cand.begin(), cand.begin() + eff_top_k, cand.end(), [](const auto & a, const auto & b) {
+                                return a.first > b.first;
+                            });
+                            cand.resize(size_t(eff_top_k));
+                        }
+                        std::sort(cand.begin(), cand.end(), [](const auto & a, const auto & b) {
                             return a.first > b.first;
                         });
 
-                        const float min_p_thresh = (r.min_p > 0.0f) ? (r.min_p * probs[0].first) : 0.0f;
+                        const float max_l = cand[0].first;
+                        float sum = 0.0f;
+                        for (auto & p : cand) {
+                            p.first = std::exp((p.first - max_l) / r.temp);
+                            sum += p.first;
+                        }
+                        if (sum > 0.0f) {
+                            for (auto & p : cand) p.first /= sum;
+                        }
+
+                        const float min_p_thresh = (r.min_p > 0.0f) ? (r.min_p * cand[0].first) : 0.0f;
                         float cum = 0.0f;
-                        int cutoff = (int)probs.size();
-                        for (size_t i = 0; i < probs.size(); ++i) {
-                            if (min_p_thresh > 0.0f && probs[i].first < min_p_thresh && i > 0) {
+                        int cutoff = (int)cand.size();
+                        for (size_t i = 0; i < cand.size(); ++i) {
+                            if (min_p_thresh > 0.0f && cand[i].first < min_p_thresh && i > 0) {
                                 cutoff = (int)i;
                                 break;
                             }
-                            cum += probs[i].first;
+                            cum += cand[i].first;
                             if (cum >= r.top_p) {
                                 cutoff = (int)i + 1;
                                 break;
@@ -4775,53 +6389,38 @@ int main(int argc, char ** argv) {
                         }
                         if (cutoff < 1) cutoff = 1;
 
-                        std::uniform_real_distribution<float> dist(0.0f, cum);
+                        std::uniform_real_distribution<float> dist(0.0f, cum > 0.0f ? cum : 1.0f);
                         float rnd = dist(rng);
-                        tok = probs[0].second;
+                        tok = cand[0].second;
                         for (int i = 0; i < cutoff; ++i) {
-                            rnd -= probs[i].first;
+                            rnd -= cand[size_t(i)].first;
                             if (rnd <= 0.0f) {
-                                tok = probs[i].second;
+                                tok = cand[size_t(i)].second;
                                 break;
                             }
                         }
                     }
 
                     std::string piece = common_token_to_piece(ctx, tok);
-                    full_response += piece;
                     ++generated;
                     session_tokens.push_back(tok);
+                    if (max_recent > 0) {
+                        if (recent_gen.size() >= size_t(max_recent)) {
+                            recent_gen.erase(recent_gen.begin());
+                        }
+                        recent_gen.push_back(tok);
+                    }
                     runtime.quality_estimator.record_token(tok);
                     if (ttft_ms == 0.0) ttft_ms = atlas::elapsed_ms(request_start, atlas::clock::now());
 
-                    if (tok == eos || llama_vocab_is_eog(vocab, tok)) {
+                    g_ipc_generated.store(generated);
+                    if (token_emitter.push(tok, piece, (tok == eos || llama_vocab_is_eog(vocab, tok)), full_response)) {
                         finish_reason = "stop";
                         break;
                     }
-
-                    bool matched_stop = false;
-                    for (const auto & s : r.stop) {
-                        if (!s.empty() && full_response.size() >= s.size() &&
-                            full_response.compare(full_response.size() - s.size(), s.size(), s) == 0) {
-                            matched_stop = true;
-                            break;
-                        }
-                    }
-                    if (matched_stop) {
-                        finish_reason = "stop";
-                        break;
-                    }
-
-                    nlohmann::json tok_event = {
-                        {"event", "token"},
-                        {"id", r.id},
-                        {"token", piece},
-                        {"token_id", (int)tok}
-                    };
-                    std::printf("%s\n", json_dump_safe(tok_event).c_str());
-                    std::fflush(stdout);
                     // No consumer needs logits after the final requested token.
                     if (generated >= r.n_predict) {
+                        token_emitter.flush();
                         finish_reason = "length";
                         break;
                     }
@@ -4831,19 +6430,22 @@ int main(int argc, char ** argv) {
                     const auto t_dec0 = atlas::clock::now();
                     int decode_res = llama_decode(ctx, dec_batch);
                     const double decode_ms = atlas::elapsed_ms(t_dec0, atlas::clock::now());
+                    atlas::atlas_sync_unified_cache_after_step(runtime, 48, true);
                     runtime.finish_token_timeline(generated, decode_ms, 0.0, 0.0);
                     if (cfg.gpu_first) {
                         runtime.execute_gpu_first_token(generated, runtime.last_layer_experts);
                     }
 
-                    if (decode_res != 0) {
-                        finish_reason = "error";
+                    if (decode_res != 0 || cancel_cur.load()) {
+                        finish_reason = cancel_cur.load() ? "cancelled" : "error";
                         break;
                     }
                 }
             }
 
 
+
+            token_emitter.flush();
 
             nlohmann::json done_event = {
                 {"event", "done"},
@@ -4852,7 +6454,11 @@ int main(int argc, char ** argv) {
                 {"prompt_tokens", (int)req_tokens.size()},
                 {"completion_tokens", generated},
                 {"cached_prompt_tokens", reused_tokens},
-                {"prompt_cache_bytes", cached_state.capacity() + cached_logits.capacity() * sizeof(float) + stable_state.capacity()},
+                {"prefix_fork_kind", prefix_fork_kind},
+                {"prefix_tree_slots", prefix_cache.slots.size()},
+                {"session_id", r.session_id},
+                {"priority", r.priority},
+                {"prompt_cache_bytes", prefix_cache.total_bytes()},
                 {"router_observations_total", runtime.memory_manager.get_metrics().decode_router_events},
                 {"expert_page_bytes", runtime.memory_manager.get_metrics().expert_page_bytes},
                 {"dram_read_bytes", runtime.memory_manager.get_metrics().dram_counter_available ? nlohmann::json(runtime.memory_manager.get_metrics().dram_read_bytes) : nlohmann::json(nullptr)},
@@ -4873,7 +6479,9 @@ int main(int argc, char ** argv) {
                 {"spec_draft_time_ms", req_draft_ms},
                 {"spec_verify_time_ms", req_verify_ms},
                 {"spec_acceptance_rate", req_drafted > 0 ? double(req_accepted) / double(req_drafted) : 0.0},
+                {"spec_verify_bs_avg", req_verify_steps > 0 ? double(req_verify_batch_sum) / double(req_verify_steps) : 0.0},
                 {"spec_effective_tps", (req_verify_ms + req_draft_ms) > 0.0 ? double(generated) / ((req_verify_ms + req_draft_ms) * 1e-3) : 0.0},
+                {"dma_promoted", runtime.unified_cache.get_dma_promoted()},
                 {"vnni_nrc2_calls", (int64_t)ggml_vnni_nrc2_get_call_count()},
                 {"tlep_enabled", cfg.enable_tlep},
                 {"tlep_slack_gpu_util", runtime.tlep_metrics.gpu_slack_utilization()},
@@ -4890,11 +6498,18 @@ int main(int argc, char ** argv) {
                 {"prefill_compute_ms", prefill_compute_ms},
                 {"checkpoint_ms", checkpoint_ms},
                 {"gpu_compute_ms", prefill_gpu_compute_ms},
-                {"elapsed_ms", atlas::elapsed_ms(request_start, atlas::clock::now())},
-                {"text", full_response}
+                {"elapsed_ms", atlas::elapsed_ms(request_start, atlas::clock::now())}
             };
-            std::printf("%s\n", json_dump_safe(done_event).c_str());
-            std::fflush(stdout);
+            static const bool done_include_text = (std::getenv("ATLAS_DONE_INCLUDE_TEXT") != nullptr &&
+                                                   std::string(std::getenv("ATLAS_DONE_INCLUDE_TEXT")) == "1");
+            if (done_include_text) {
+                done_event["text"] = full_response;
+            }
+            ipc_emit(done_event);
+            g_ipc_phase.store(0);
+            g_ipc_prefill_pos.store(0);
+            g_ipc_prefill_total.store(0);
+            g_ipc_generated.store(0);
 
             llama_synchronize(ctx);
             llama_memory_clear(llama_get_memory(ctx), false);
@@ -4907,7 +6522,7 @@ int main(int argc, char ** argv) {
             if (runtime.async_transfer_pipeline) {
                 runtime.async_transfer_pipeline->clear();
             }
-            atlas::atlas_set_is_decode(0);
+            atlas::atlas_set_all_decode_flags(0);
             atlas::atlas_reset_decode_step();
 
             {
@@ -4916,6 +6531,12 @@ int main(int argc, char ** argv) {
             }
         }
 
+        is_running.store(false);
+        cv.notify_all();
+        hb_cv.notify_all();
+        if (heartbeat.joinable()) {
+            heartbeat.join();
+        }
         if (reader.joinable()) {
             reader.detach();
         }
@@ -4928,22 +6549,29 @@ int main(int argc, char ** argv) {
 #endif
     }
 
-    // Prompt evaluation
+    // Prompt evaluation (chunked cleanly to params.n_batch)
     const auto t_prompt_start = atlas::clock::now();
-    llama_batch batch_prompt = llama_batch_init(tokens.size(), 0, 1);
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        common_batch_add(batch_prompt, tokens[i], i, { seq_id }, i == tokens.size() - 1);
-    }
-    if (llama_decode(ctx, batch_prompt) != 0) {
-        llama_batch_free(batch_prompt);
-        std::printf("[ATLAS] error: prompt decode failed\n"); return 4;
+    const int32_t cli_chunk = std::max<int32_t>(1, params.n_batch > 0 ? params.n_batch : 512);
+    llama_batch batch_prompt = llama_batch_init(std::min<int32_t>(cli_chunk, (int32_t)tokens.size()), 0, 1);
+    for (size_t off = 0; off < tokens.size(); off += size_t(cli_chunk)) {
+        const size_t n_cur = std::min<size_t>(size_t(cli_chunk), tokens.size() - off);
+        common_batch_clear(batch_prompt);
+        for (size_t i = 0; i < n_cur; ++i) {
+            common_batch_add(batch_prompt, tokens[off + i], llama_pos(off + i), { seq_id }, (off + i == tokens.size() - 1));
+        }
+        if (llama_decode(ctx, batch_prompt) != 0) {
+            llama_batch_free(batch_prompt);
+            std::printf("[ATLAS] error: prompt decode failed\n"); return 4;
+        }
+        if (spec) {
+            if (!common_speculative_process(spec.get(), batch_prompt)) {
+                llama_batch_free(batch_prompt);
+                std::fprintf(stderr, "[ATLAS] speculative prefill failed\n");
+                return 4;
+            }
+        }
     }
     if (spec) {
-        if (!common_speculative_process(spec.get(), batch_prompt)) {
-            llama_batch_free(batch_prompt);
-            std::fprintf(stderr, "[ATLAS] speculative prefill failed\n");
-            return 4;
-        }
         prompt_tgt = tokens;
         common_speculative_begin(spec.get(), seq_id, prompt_tgt);
     }
@@ -4953,6 +6581,11 @@ int main(int argc, char ** argv) {
 
     // Mark prompt decode completed: all subsequent calls are generation decodes
     runtime.saw_decode = true;
+    runtime.last_moe_cb_layer = -1;
+    runtime.tokens_decoded = 0;
+    atlas::atlas_sync_unified_cache_after_step(runtime, 48, true);
+    atlas::atlas_set_all_decode_flags(1);
+    atlas::atlas_reset_decode_step();
     atlas::GlobalTracer::get().clear();
     std::memset(runtime.current_token_layer_page_bytes, 0, sizeof(runtime.current_token_layer_page_bytes));
 
@@ -5141,6 +6774,7 @@ int main(int argc, char ** argv) {
                 decode_failed = true;
                 break;
             }
+            atlas::atlas_sync_unified_cache_after_step(runtime, 48, true);
             const double verify_ms = atlas::elapsed_ms(t_v0, atlas::clock::now());
             total_verify_ms += verify_ms;
             if (cfg.enable_tlep) {
@@ -5313,6 +6947,7 @@ int main(int argc, char ** argv) {
             const auto t_dec0 = atlas::clock::now();
             int decode_res = llama_decode(ctx, batch);
             const double decode_ms = atlas::elapsed_ms(t_dec0, atlas::clock::now());
+            atlas::atlas_sync_unified_cache_after_step(runtime, 48, true);
 
             runtime.finish_token_timeline(generated, decode_ms, sample_ms, 0.0);
             if (cfg.gpu_first) {
@@ -5356,6 +6991,8 @@ int main(int argc, char ** argv) {
         {"moe_cache_hits", runtime.split_moe_cache ? runtime.split_moe_cache->get_hits() : 0},
         {"moe_cache_misses", runtime.split_moe_cache ? runtime.split_moe_cache->get_misses() : 0},
         {"moe_cache_hit_rate", runtime.split_moe_cache ? runtime.split_moe_cache->get_hit_rate() : 0.0},
+        {"dma_promoted", runtime.unified_cache.get_dma_promoted()},
+        {"active_vram_layer_mask", runtime.active_vram_layer_mask},
         {"expert_wait_us", 0.0},
         {"diagnostic_run", cfg.verify_batch},
         {"native_k", llama_model_n_expert_used(model)}, {"failed", decode_failed}
@@ -5421,7 +7058,19 @@ int main(int argc, char ** argv) {
     std::printf("Entropy Score:         %.1f%%\n", runtime.quality_estimator.compute_entropy_score() * 100.0);
     }
     std::printf("Quality Floor Status:  NOT_EVALUATED (requires external task accuracy >= %.1f%%)\n", cfg.quality_target * 100.0);
-    std::printf("Dynamic Expert H2D:    NOT_IMPLEMENTED (static llama.cpp offload executes experts)\n");
+    if (runtime.unified_cache.has_real_vram() || runtime.unified_cache.has_real_ram()) {
+        std::printf("Dynamic Expert Cache:  ACTIVE (VRAM slots=%d hits=%" PRIu64 " misses=%" PRIu64 " H2D=%.2f MiB dma_promoted=%" PRIu64 " | RAM slots=%d hits=%" PRIu64 " misses=%" PRIu64 ")\n",
+            runtime.unified_cache.vram_slots(),
+            runtime.unified_cache.vram_hits(),
+            runtime.unified_cache.vram_misses(),
+            double(runtime.unified_cache.h2d_bytes()) / (1024.0 * 1024.0),
+            runtime.unified_cache.get_dma_promoted(),
+            runtime.unified_cache.ram_slots(),
+            runtime.unified_cache.ram_hits(),
+            runtime.unified_cache.ram_misses());
+    } else {
+        std::printf("Dynamic Expert Cache:  FALLBACK (static offload)\n");
+    }
     if (cfg.enable_odmoe && observe_router) {
         std::printf("OD-MoE Predictor Policy: (Lead=%d layers, Quick-Evict=%s | Dispatches=%" PRIu64 ", Lead Hits=%" PRIu64 ", Quick Evictions=%" PRIu64 ")\n",
             cfg.odmoe_layer_lead, cfg.odmoe_quick_evict ? "ON" : "OFF",

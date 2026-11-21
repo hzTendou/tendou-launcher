@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="desktop/src-tauri/icons/icon.png" alt="Tendou Launcher Icon" width="112" />
+
 # Tendou Launcher
 
 ### Independent MoE Inference Platform & Launcher for Gaming Hardware
@@ -7,14 +9,14 @@
 Run massive Mixture-of-Experts (MoE) models locally with high throughput, low latency, and zero cloud dependencies on standard consumer laptops.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-7c3aed.svg)](LICENSE)
-![Version](https://img.shields.io/badge/Release-v0.14.0--stable-blue)
-![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
-![Windows 11](https://img.shields.io/badge/Windows-11-0078D4?logo=windows11&logoColor=white)
-![CUDA 13](https://img.shields.io/badge/CUDA-13.0-76B900?logo=nvidia&logoColor=white)
-![AVX-512 VNNI](https://img.shields.io/badge/AVX--512-VNNI%20x4%2Fnrc2-orange)
-![Tests](https://img.shields.io/badge/Tests-109%20PASS%20%7C%2028%20Gates%20PASS-brightgreen)
+![Version](https://img.shields.io/badge/Release-v0.16.3--stable-D4A574)
+![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
+![Linux & Windows 11](https://img.shields.io/badge/Platform-Kubuntu%20%7C%20Windows%2011-0078D4)
+![CUDA 13.2](https://img.shields.io/badge/CUDA-13.2%20sm__120a-76B900?logo=nvidia&logoColor=white)
+![AVX-512](https://img.shields.io/badge/SIMD-512--bit%20AVX--512%20x4%200--ULP-orange)
+![Tests](https://img.shields.io/badge/Tests-48%20Native%20Gates%20%7C%20Unit%2FIntegration%20PASS-brightgreen)
 
-**[Quick Start](#quick-start)** · **[Architecture](#architecture)** · **[Benchmarks](#empirically-verified-benchmarks)** · **[Releases](#releases)** · **[Research & Docs](#research--documentation-center)** · **[Agent Integration](#agent-integrations)**
+**[Quick Start](#quick-start)** · **[Tendou Studio UI](#tendou-studio-web--desktop-app)** · **[Architecture](#architecture-overview)** · **[Benchmarks](#empirically-verified-benchmarks)** · **[Releases](#releases)** · **[Docs & Guides](#research--documentation-center)** · **[Agent Integration](#agent-integrations)**
 
 </div>
 
@@ -22,145 +24,135 @@ Run massive Mixture-of-Experts (MoE) models locally with high throughput, low la
 
 ## What is Tendou Launcher?
 
-**Tendou Launcher** is an **independent Mixture-of-Experts (MoE) inference platform and local launcher**. It is designed from scratch to run large MoE models (such as Qwen 3.5 122B, Qwen 3.8 Flash Next 197B, and Qwen 3.6 35B) at practical token generation speeds (**20–72 tokens/sec**) on everyday hardware—specifically targeting gaming laptops with **8 GiB VRAM and 16 GiB RAM**.
+**Tendou Launcher (`v0.16.3-stable`)** is an **independent Mixture-of-Experts (MoE) inference platform, control plane, and desktop studio**. It runs massive MoE models (`Qwen3.6-35B-A3B` 16.5 GiB and `Qwen3.8-Flash-Next` 75.8 GB) at high token speeds (**up to 102.8 tokens/sec** on 35B and **42.5 tokens/sec** on 75.8 GB 38B, MTP strictly OFF by default) with zero Out-of-Memory crashes on everyday **8 GiB VRAM / 16 GiB RAM** laptops across **Linux (Kubuntu 26.04)** and **Windows 11**.
 
 > [!IMPORTANT]
-> **Independent Platform Principle:** Tendou Launcher is **NOT** a fork, mod, or wrapper of `llama.cpp`. It features its own:
-> - **Hierarchical Working Set Manager (HWSM)** with Dynamic 3-Tier memory tiering (VRAM Tier-0 ↔ RAM Tier-1 ↔ DirectStorage Tier-2),
-> - **True Zero-Syscall Slab Arenas** (`ExpertSlabPool` with `VirtualLock` pre-allocation),
-> - **Hardware-optimized AVX-512 VNNI CPU kernels** (`ggml_vec_dot_mxfp4_q8_0_x4` & `_nrc2`) with 0-ULP bit-exact parity,
-> - **Unified Zero-Prefill Prompt KV Caching** for instant multi-turn conversational responses,
-> - **DirectStorage NVMe DMA contiguous range coalescing**,
-> - **Multi-Protocol Agent Server** natively serving OpenCode, Claude Code CLI, and Cline.
+> **Independent Platform Principle:** Tendou Launcher is **NOT** a fork or simple wrapper of `llama.cpp`. It delivers:
+> - **3-Regime Zero-Copy Hot-RAM Planner & GPU Shadow Page Reclamation** (`v0.16.3`): Evicts ~4.7–6.0 GiB of dead GPU-uploaded shadow pages from OS page cache; uses `zero-copy-mlock` when CPU MoE fits RAM cleanly, switches automatically to reclaimable `zero-copy-prewarm` (~9.5–10.6 GiB Hot RAM, selective THP) on near-fitting models (`Qwen3.6-35B` on 16 GiB RAM — **-52.9% to -67.9%** Cold TTFT and **+106% to +154%** Cold Decode TPS without swap thrashing), and switches to `reclaimed-pagecache` for 70+ GiB streaming models (**Gate 48**),
+> - **True 512-Bit AVX-512F+BW+VL + VNNI (`vpdpwssd`) 4-Row Fused Kernels** (`ggml_vec_dot_iq4_xs_q8_K_x4`, `ggml_vec_dot_iq3_xxs_q8_K_x4`, `ggml_vec_dot_iq3_s_q8_K_x4`) cutting L1 activation loads by 75% (`+18.3%` @ 8T `IQ4_XS_x4`, `+26.0%` @ 16T `IQ3_XXS_x4` vs AVX2) with **0-ULP IEEE-754 parity (Gates 45–47)**,
+> - **Boost-Aware Non-Contiguous GPU MoE Placement & AutoTune v0.16.3 Adaptive KV Cache** (`layers 0–1` + reasoning band `15–20` on GPU; `q8_0` at `<=8K`, `FP8 E4M3` at `>=16K` with strict `1,024 MiB` VRAM headroom),
+> - **3-Tier Hybrid Memory Hierarchy**: CUDA GDDR6 VRAM (Tier 0) ↔ Zero-Copy Hot-RAM MMAP/THP (Tier 1) ↔ Async NVMe DMA (`io_uring` on Linux / `DirectStorage` & Overlapped I/O on Windows 11, Tier 2),
+> - **Tendou Studio (`v0.16.3` Obsidian & Alabaster Edition — Web UI + Tauri v2 Desktop App)** with ChatGPT-style **persistent chat history (`data/chats/`)**, **background-resilient streaming** that survives tab switches and browser reloads, live **Context Growth Curve** backed by real server timings & PrefixCache fork telemetry, **real kernel Hot-RAM & CPU telemetry**, **all 52 CLI flags**, Zero-Zombie Hot-Swap, and Agent Hub for **Claude Code**, **OpenCode**, and **Cline**.
 >
-> `llama.cpp` and `ggml` are utilized strictly as an underlying low-level tensor arithmetic and compute backend dependency. All frozen production binaries and sources are published directly under [`releases/`](releases/).
+> `llama.cpp` and `ggml` serve strictly as the low-level tensor arithmetic backend (`patches/llama.cpp.patch`). Frozen stable releases live under [`releases/`](releases/).
+
+---
+
+## Tendou Studio (Web & Desktop App)
+
+Starting the server automatically serves the prebuilt **Tendou Studio** React 19 + TypeScript + Tailwind v4 SPA at **`http://127.0.0.1:8000/`** (zero Node.js needed at runtime), redesigned in a restrained, Apple-inspired **Obsidian Dark (`#0A0A0C`) & Alabaster Light (`#F5F5F7`)** aesthetic with frosted glass chrome, hairline borders, champagne-bronze accents (`#D4A574`), and tabular numerals. An optional native **Tauri v2** desktop shell (`desktop/src-tauri/`) provides system-tray lifecycle management with zero-zombie cleanup (Unix process group & Win32 Job Object):
+
+- **ChatGPT-Style Persistent Chats & Background-Resilient Streaming:** Full multi-conversation history stored atomically under `data/chats/` with search, pin, rename, delete, edit-and-resend, regenerate, and `.md` download export. Root-mounted `ChatProvider` keeps streams alive in the background across tab switches, binds each thread to `X-Tendou-Session-Id` for PrefixCache hits, and plots a live **Context Growth Curve** (context tokens vs real server TTFT, decode TPS & PrefixCache fork hits per turn).
+- **Always-Visible Precision Telemetry Bar:** Live 4 Hz SSE decode TPS, EMA, TTFT, VRAM, **real kernel Hot-RAM (`VmRSS` / `VmLck` & mode)**, engine CPU utilization, and Start/Stop/Restart controls.
+- **Engine Settings (All 52 CLI Flags):** 6 organized categories, one-click hardware presets (`MTP = OFF` by default), live Linux/Windows CLI serializer, and atomic profile persistence.
+- **Models, Agents & Benchmarks:** Automatic GGUF scanner + AutoTune v0.16.3 planner + zero-zombie hot-swap, copyable Claude Code / OpenCode / Cline configs, benchmark history, and live SSE engine logs.
 
 ---
 
 ## Architecture Overview
 
-Tendou Launcher solves the **MoE Memory Wall** by decoupling activated parameters from resident weight storage through a dynamic 3-tier memory hierarchy:
+Tendou Launcher solves the **MoE Memory Wall** through a 3-tier hybrid hierarchy coordinated by FastAPI (`/v1/*` + `/api/ui/*`) and a persistent IPC C++/CUDA runtime (`tendou-engine`):
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            TENDOU LAUNCHER ARCHITECTURE                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-       OpenCode Client          Claude Code CLI             Cline (NIM/XML)
-   (/v1/chat/completions)     (/v1/messages, /messages)   (/v1/chat/completions)
-             │                           │                          │
-             └───────────────────────────┼──────────────────────────┘
-                                         ▼
-                 ┌───────────────────────────────────────────┐
-                 │         Multi-Protocol API Server         │  (src/atlas/server.py)
-                 │  • Zero-overhead incremental JSON stream  │
-                 │  • Anthropic <-> ChatML bi-directional    │
-                 │  • Cline XML parser & single-tool breaker │
-                 │  • Dynamic Speculative Horizon (d* in 0..3│
-                 └─────────────────────┬─────────────────────┘
-                                       │ Line-delimited JSON IPC
-                                       ▼
-                 ┌───────────────────────────────────────────┐
-                 │       tendou-engine.exe (C++ Native)      │  (releases/v0.14.0-stable)
-                 │  • Unified Zero-Prefill Prompt KV Cache   │
-                 │  • Hierarchical Working Set Manager (HWSM)│
-                 │  • Zero-Syscall ExpertSlabPool Arenas     │
-                 │  • DirectStorage NVMe DMA Coalescing      │
-                 └─────────────────────┬─────────────────────┘
-                                       │
-        ┌──────────────────────────────┼──────────────────────────────┐
-        ▼                              ▼                              ▼
- ┌──────────────┐              ┌──────────────┐              ┌──────────────┐
- │  Tier-0 Hot  │              │  Tier-1 Warm │              │  Tier-2 Cold │
- │   GPU VRAM   │ ◄──────────► │   Host RAM   │ ◄──────────► │  DirectStorage│
- │  (8GB GDDR6) │   Promotion  │ (VirtualLock)│   Demotion   │ (NVMe 4KB DMA│
- │ CUDA Compute │              │ AVX-512 VNNI │              │  Coalesced)  │
- └──────────────┘              └──────────────┘              └──────────────┘
+  Tendou Studio Web UI / Tauri v2  |  Claude Code (/v1/messages)  |  OpenCode & Cline (/v1/chat/completions)
+                                                  │
+                                                  ▼
+               ┌────────────────────────────────────────────────────────────────────┐
+               │   FastAPI Control Plane, Chat Store & Telemetry Hub (src/atlas/)   │
+               │   • Atomic Chat History (/api/ui/chats) + Context Growth Curve     │
+               │   • 4 Hz SSE Live TPS, Kernel VmRSS/VmLck Hot-RAM & Engine CPU     │
+               │   • PriorityEngineGate (Swarm P0/P1/P2) + 16-Slot PrefixCache      │
+               │   • AutoTune v0.16.3 (Non-Contiguous GPU Layers + Adaptive FP8 KV) │
+               └──────────────────────────────────┬─────────────────────────────────┘
+                                                  │ Persistent Line-Delimited JSON IPC
+                                                  ▼
+               ┌────────────────────────────────────────────────────────────────────┐
+               │   tendou-engine v0.16.3-stable (C++ / CUDA 13.2 / AVX-512 VNNI)    │
+               ├──────────────────────┬───────────────────────┬─────────────────────┤
+               │ Tier 0: CUDA VRAM    │ Tier 1: Hot-RAM THP   │ Tier 2: NVMe Stream │
+               │ 8 GiB GDDR6 (sm_120a)│ GPU-Shadow Evicted    │ Linux: io_uring     │
+               │ Lay 0–1 + 15–20 MoE  │ 3-Regime Prewarm/Lock │ Win11: DirectStorage│
+               │ FP8 E4M3 FlashAttn   │ 512b AVX-512 VNNI x4  │ Reclaimed PageCache │
+               │ 1,024 MiB OOM Guard  │ 0-ULP (Gates 45–48)   │ 3-Tensor 4KB DMA    │
+               └──────────────────────┴───────────────────────┴─────────────────────┘
 ```
 
 ---
 
-## Empirically Verified Benchmarks
+## Empirically Verified Benchmarks (`v0.16.3-stable`, MTP OFF)
 
-*Hardware: AMD Ryzen 7 (8C/16T, DDR5-5600), NVIDIA GeForce RTX 5060 Laptop (8 GiB VRAM), 16 GiB System RAM, Windows 11.*
+*Hardware: AMD Ryzen 7 260 (8C/16T Zen 4 AVX-512 VNNI), NVIDIA GeForce RTX 5060 Laptop (8 GiB / 8,151 MiB VRAM), 14.9 GiB System RAM, Kubuntu 26.04 (CUDA 13.2 `sm_120a`, GCC 14.3). All runs strictly **`--mtp off`**, `--auto-plan --boost --fp8-kv`. Source JSON: [`docs/json/benchmark_v16_3_kubuntu_report.json`](docs/json/benchmark_v16_3_kubuntu_report.json).*
 
-| Model | Quantization | Total / Active Params | Layer / Expert Count | Warm Decode TPS | Warm TTFT | VRAM Peak | Speedup vs Baseline |
+| Model | Size on Disk | AutoTune GPU Layers | Peak VRAM | Hot RAM Mode | W1 OpenCode Cold TTFT / Cold TPS | W2 Greenfield Cold TTFT & Warm TPS | W3 Tool-Call Cold TTFT & Peak TPS |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Qwen3.5-122B-A10B** | **MXFP4_MOE** | 122B / ~10B | 48L / 256E (Top-8) | **24.40 – 33.74 tok/s** | **21.7 – 84.1 ms** | 7,240 MiB | **6.4x – 8.9x vs Q6_K_P** |
-| **Qwen3.8-Flash-Next** | **IQ3_XXS** | 197B / ~14B | 48L / 512E (Top-10) | **24.30 – 34.48 tok/s** | **20.1 – 43.3 ms** | 7,190 MiB | **4.2x vs Cold Start** |
-| **Qwen3.6-35B-A3B** | **UD-IQ4_XS** | 35B / ~3B | 40L / 256E (Top-8) | **52.49 – 72.12 tok/s** | **14.7 – 39.3 ms** | 5,950 MiB | **2.8x vs Plain CPU** |
+| **Qwen3.6-35B-A3B** | **16.5 GiB** | **8 non-contiguous** (`0..1 + 15..20`) | **6,395.4 MiB** | **~9.5–10.6 GiB** (`zero-copy-prewarm`) | **663.1 ms (-67.9%) · 69.1 tok/s (+123.8%)** | **634.3 ms (-52.9%) · 78.1–85.1 tok/s** | **2,547.6 ms (-33.1%) · 102.8 tok/s** |
+| **Qwen3.8-Flash-Next** | **75.8 GB** | **2 safe cap** (OOM Guard) | **6,989.3 MiB** | **Reclaimed OS Page Cache** (`reclaimed-pagecache`) | **4,662.1 ms · 6.4 tok/s** | **3,337.1 ms · 35.7 tok/s** | **8,953.2 ms · 42.5 tok/s** |
 
-*All metrics are verified with 100% deterministic bit-exact parity (0-ULP) and KL-divergence $\text{KL} = 0.000000$ against native FP32/FP16 models. Detailed data points are available in [`docs/json/`](docs/json/).*
+**Controlled Direct GPU IPC (`Qwen3.6-35B-A3B`, `v0.16.2` vs `v0.16.3`, `-t 8`, `-c 8192`, `--boost`):**
+- **`Qwen3.6-35B-A3B` (`zero-copy-prewarm` + AVX-512 VNNI):** Cold load **`6.4s`**, Turn 1 Cold **`1,750 -> 680.1 ms`** / **`26.48 -> 67.15 TPS` (+153.6%)**, Turn 2 Warm **`78.81 -> 83.27 TPS` (+5.7%)**, Turn 3 Cold-Prompt **`700 -> 327.2 ms`** / **`59.88 -> 75.79 TPS` (+26.6%)**, Turn 4 Warm **`83.70 -> 85.21 TPS`**, Full `K=8` (`--no-boost`) **`34.28 / 32.41 TPS`** with zero swap thrashing.
+- **AVX-512 VNNI SIMD Microbenchmark (0-ULP Gate 47):** `IQ4_XS_x4` **`59.89 GB/s` @ 8T (+18.3% vs AVX2, +17.3% @ 16T)**; `IQ3_XXS_x4` **`+4.9% @ 8T / +26.0% @ 16T` vs AVX2**.
 
 ---
 
 ## Releases
 
-All production-grade, frozen stable releases are bundled directly under [`releases/`](releases/):
+All production-grade, frozen stable releases are published under [`releases/`](releases/):
 
-- 🌟 **[`releases/tendou-v0.14.0-stable/`](releases/tendou-v0.14.0-stable/)**: Current Flagship Release
-  - Complete pre-compiled binary package: `bin/tendou-engine.exe`, `bin/ggml-cpu.dll` (AVX-512 VNNI/VBMI), `bin/ggml-cuda.dll` (CUDA 13), `bin/llama.dll`, `bin/llama-common.dll`.
-  - Full source snapshot: `source/` (C++ engine source, AVX-512 quants, autotune, server).
-  - Release manifesto & verification record: [`RELEASE_NOTES.md`](releases/tendou-v0.14.0-stable/RELEASE_NOTES.md).
-- **[`releases/tendou-v0.13.0-stable/`](releases/tendou-v0.13.0-stable/)**: Universal Auto-Tuner & Dynamic MoE Topology Milestone.
-- **[`releases/tendou-v0.11.0-stable/`](releases/tendou-v0.11.0-stable/)**: Multi-Token Prediction (MTP) & Hybrid State Cache Milestone.
-- **[`releases/tendou-v0.9.0-stable/`](releases/tendou-v0.9.0-stable/)**: Cross-Layer GPU Pinning & Zero-Copy Subprocess IPC.
-- **[`releases/tendou-v0.8.0-stable/`](releases/tendou-v0.8.0-stable/)**: Initial Stable Runtime Baseline.
+- 🌟 **[`releases/tendou-v0.16.3-stable/`](releases/tendou-v0.16.3-stable/)**: **Current Flagship Release**
+  - Zero-Copy Boost-Aware Hot-RAM THP Pinning + GPU Shadow Page Reclamation (Gate 48), 512-bit AVX-512 `IQ4_XS_x4` & `IQ3_XXS_x4` kernels (Gate 47 0-ULP), Real Kernel Hot-RAM/CPU Telemetry, ChatGPT-style Persistent Chat History & Background-Resilient Streaming with Context Growth Curve, and Apple-inspired Obsidian & Alabaster Tendou Studio redesign.
+  - Full Linux binaries (`bin/tendou-engine`, `bin/llama-server`, `libggml-*.so`), full source snapshot (`source/`), and [`RELEASE_NOTES.md`](releases/tendou-v0.16.3-stable/RELEASE_NOTES.md).
+- **[`releases/tendou-v0.16.2-stable/`](releases/tendou-v0.16.2-stable/)**: Boost-Aware Non-Contiguous GPU MoE placement, `IQ3_S_x4` (Gate 46), Windows 11 integration, initial Tendou Studio Web/Tauri v2.
+- **[`releases/tendou-v0.16.1-stable/`](releases/tendou-v0.16.1-stable/)**: 4-Row `IQ4_XS_x4` (Gate 45) & Synchronized Dynamic-K Turbo.
+- **[`releases/tendou-v0.16.0-stable/`](releases/tendou-v0.16.0-stable/)**: FP8 E4M3 FlashAttention VEC (`7.05 µs`), 3-Tensor NVMe `io_uring` DMA, Multi-Agent Swarm IPC.
+- **[`releases/tendou-v0.15.0-stable/`](releases/tendou-v0.15.0-stable/)** · **[`v0.14.0`](releases/tendou-v0.14.0-stable/)** · **[`v0.13.0`](releases/tendou-v0.13.0-stable/)** · **[`v0.11.0`](releases/tendou-v0.11.0-stable/)** · **[`v0.9.0`](releases/tendou-v0.9.0-stable/)** · **[`v0.8.0`](releases/tendou-v0.8.0-stable/)**.
 
 ---
 
 ## Research & Documentation Center
 
-Tendou Launcher maintains a comprehensive R&D and engineering record under [`docs/`](docs/):
-
-- 📚 **Technical Articles ([`docs/articles/`](docs/articles/))**:
-  - [`RESEARCH_HISTORY_AND_METHODOLOGY.md`](docs/articles/RESEARCH_HISTORY_AND_METHODOLOGY.md): Chronological Phase 0 through Phase 14 Ar-Ge journey and evidence-based engineering.
-  - [`HYPOTHESIS_ANALYSIS_PROVEN_AND_REFUTED.md`](docs/articles/HYPOTHESIS_ANALYSIS_PROVEN_AND_REFUTED.md): Refuted hypotheses (Memory Wall, in-loop naive prefetch, speculative MTP traps) vs proven architectures (zero-syscall slab arenas, AVX-512 VNNI, DirectStorage coalescing).
-  - [`ARCHITECTURE_AND_INFERENCE_ENGINE.md`](docs/articles/ARCHITECTURE_AND_INFERENCE_ENGINE.md): Deep-dive into memory managers, slab arenas, and tensor layouts.
-  - [`claude_code_and_opencode_integration_guide.md`](docs/articles/claude_code_and_opencode_integration_guide.md): Tri-protocol guide for Claude Code, OpenCode, and Cline.
-- 📊 **Empirical Validation Datasets ([`docs/json/`](docs/json/))**:
-  - 18 empirical JSON reports verifying all speed, latency, memory, and parity claims ([`docs/json/README.md`](docs/json/README.md)).
-- 🏛️ **Architecture & Specifications ([`docs/architecture/`](docs/architecture/), [`docs/specs/`](docs/specs/))**:
-  - [`V1_RUNTIME_SPEC.md`](docs/specs/V1_RUNTIME_SPEC.md), [`LLAMA4_ARCHITECTURE_AND_OPTIMIZATION_PLAN.md`](docs/specs/LLAMA4_ARCHITECTURE_AND_OPTIMIZATION_PLAN.md).
-- 📜 **Historical Engineering Archives ([`docs/history/`](docs/history/))**:
-  - Full changelogs, experiment logs, and walkthroughs from earlier phases.
-- 🧪 **Development Phases ([`tests/phases/`](tests/phases/))**:
-  - Regression and architecture tests covering Phase 0 through Phase 11.
+- 🐧 **Kubuntu Linux Guide:** [`docs/KUBUNTU_USER_GUIDE.md`](docs/KUBUNTU_USER_GUIDE.md)
+- 🪟 **Windows 11 Build & Runtime Guide:** [`docs/WINDOWS_USER_GUIDE.md`](docs/WINDOWS_USER_GUIDE.md)
+- 📚 **Technical Articles ([`docs/articles/`](docs/articles/)):** `RESEARCH_HISTORY_AND_METHODOLOGY.md`, `HYPOTHESIS_ANALYSIS_PROVEN_AND_REFUTED.md`, `ARCHITECTURE_AND_INFERENCE_ENGINE.md`, `claude_code_and_opencode_integration_guide.md`.
+- 📊 **Empirical Validation Datasets ([`docs/json/`](docs/json/)):** Full hardware JSON benchmark archive (`v0.14.0` through `v0.16.3`).
 
 ---
 
 ## Quick Start
 
-### 1. Installation
-
-```powershell
-# Clone the repository
+### Linux (Kubuntu 26.04 / CUDA 13.2)
+```bash
 git clone https://github.com/hzTendou/tendou-launcher.git
 cd tendou-launcher
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-# Create and activate Python environment
+# Launch API Server + Tendou Studio Web UI (http://127.0.0.1:8000/)
+./start_server.sh --port 8000
+
+# Optional: Build & run native Tauri v2 Desktop App
+./scripts/build_desktop_linux.sh
+./desktop/src-tauri/target/release/tendou-studio
+```
+
+### Windows 11 (MSVC + CUDA 13.2)
+```cmd
+git clone https://github.com/hzTendou/tendou-launcher.git
+cd tendou-launcher
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.\.venv\Scripts\activate.bat
+pip install -r requirements.txt
+
+:: 1. Build native C++/CUDA/AVX2 engine + 48 native tests
+scripts\build_windows_all.cmd
+
+:: 2. Start API Server + Tendou Studio Web UI (http://127.0.0.1:8000/)
+start_server.cmd --port 8000
+
+:: Optional: Build Tauri v2 Windows Desktop App (.exe / NSIS / MSI)
+scripts\build_desktop_windows.cmd
 ```
 
-### 2. Start the Server
-
-#### A. Mock Mode (Fast test without model weights or GPU)
-```powershell
-python atlas_server.py --mock --host 127.0.0.1 --port 8000
-```
-
-#### B. Native Mode (Using the v0.14.0-stable Engine)
-```powershell
-python atlas_server.py `
-  --exe-path "releases\tendou-v0.14.0-stable\bin\tendou-engine.exe" `
-  --model-path "D:\models\Qwen3.5-122B-A10B-MXFP4_MOE-00001-of-00003.gguf" `
-  --threads 16 `
-  --host 127.0.0.1 `
-  --port 8000
-```
+*(Quick smoke test without model weights on either OS: `python atlas_server.py --mock --port 8000` and open `http://127.0.0.1:8000/`.)*
 
 ---
 
@@ -209,13 +201,24 @@ cmake --build llama.cpp\build --config Release --target llama-atlas-engine -j
 
 ## Verification & Testing
 
-### Python Test Suite (109 Tests)
-```powershell
+### Python Test Suite (270 Tests)
+```bash
+# Quick core unit & OpenAI server suite (124 tests)
 python -m pytest tests/unit tests/integration/test_openai_server.py -q
+
+# Full repository pytest suite (270 passed, 5 optional real-GPU/E2E skipped by default)
+python -m pytest -q
 ```
 
-### Native Regression & Gate Suites (28 Gates)
+### Native Regression & Gate Suites (46 Gates)
+```bash
+# Linux (Kubuntu 26.04)
+./scripts/build_native_tests.sh
+./llama.cpp/build-linux/bin/atlas-native-tests
+./llama.cpp/build-linux/bin/atlas-partition-tests
+```
 ```powershell
+# Windows 11 (MSVC + CUDA 13.2)
 cmd /c scripts\build_native_tests.cmd
 cmd /c tests\native\build_partition_tests.cmd
 
@@ -229,21 +232,23 @@ cmd /c tests\native\build_partition_tests.cmd
 
 ```text
 tendou-launcher/
-├── releases/       # Standalone frozen stable releases (v0.8.0, v0.9.0, v0.11.0, v0.13.0, v0.14.0)
-├── docs/           # Documentation center: articles, benchmark JSONs, audits, specs, history
+├── releases/       # Standalone frozen stable releases (v0.8.0 – v0.16.2-stable)
+├── ui/             # Tendou Studio React 19 + TypeScript + Tailwind v4 Web UI (built into ui/dist/)
+├── desktop/        # Native Tauri v2 Desktop App (Linux .deb / Windows .exe)
+├── docs/           # Documentation center: guides, articles, benchmark JSONs, audits, specs
 │   ├── articles/   # Comprehensive research papers and integration guides
-│   ├── json/       # 18 empirical benchmark and validation JSON datasets
+│   ├── json/       # Empirical benchmark and validation JSON datasets
 │   ├── audits/     # Hardware and thread execution audits
 │   ├── specs/      # Runtime specifications and Llama-4 optimization plan
 │   └── history/    # Historical changelogs and experiment reports
-├── tests/          # Complete test suite: unit, integration, native, benchmarks, phases 0-11
+├── tests/          # Complete test suite: unit, integration, native (49 gates), benchmarks, phases 0-11
 │   ├── phases/     # Chronological development phase test suites (phase0 - phase11)
-│   ├── native/     # C++ parity, memory benchmarking, and partition tests
-│   └── integration/# OpenCode, Claude Code, and Cline protocol tests
-├── src/atlas/      # Multi-protocol API server, autotune engine, and C++ engine sources
-├── scripts/        # Build commands, physical map generators, and benchmark scripts
+│   ├── native/     # C++ parity (Gates 1–49), memory benchmarking, and partition tests
+│   └── integration/# OpenCode, Claude Code, Cline, and IPC resilience protocol tests
+├── src/atlas/      # Multi-protocol API server, Tendou Studio control plane (/api/ui/*), autotune & C++ engine
+├── scripts/        # Linux/Windows build commands and benchmark scripts
 ├── config/         # Runtime example profiles and hardware topologies
-├── patches/        # Reproducible backend engine integration patches
+├── patches/        # Reproducible backend engine integration patches (patches/llama.cpp.patch)
 ├── scratch/        # Diagnostic, sweep, and ablation tools
 └── data/           # Historical physical reports and telemetry traces
 ```

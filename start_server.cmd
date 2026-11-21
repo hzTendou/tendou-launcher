@@ -1,49 +1,38 @@
 @echo off
-title Tendou Launcher API Server (Port 8000 - 256k Context Max)
+setlocal enabledelayedexpansion
+title Tendou Launcher v0.16.3-stable — Studio Web UI & Local AI Server
 cd /d "%~dp0"
+set "ROOT_DIR=%CD%"
 
-:: ---------------------------------------------------------------------------
-:: Tendou Launcher - Peak Performance Configuration
-:: Model: Qwen3.6-35B-A3B-UD-Q8_K_XL (38.5 GB, 40L, 256 Experts, Native 256k Ctx)
-:: Hardware: NVIDIA RTX 5060 Laptop (8GB VRAM) + AMD Ryzen 7 260 (16 Threads)
-:: ---------------------------------------------------------------------------
+:: Prepend v0.16.3-stable & fallback Windows runtime DLL directories to PATH
+set "EXTRA_PATH=%ROOT_DIR%\releases\tendou-v0.16.3-stable\bin;%ROOT_DIR%\llama.cpp\build\bin\Release;%ROOT_DIR%\releases\tendou-v0.16.2-stable\bin;%ROOT_DIR%\releases\tendou-v0.16.1-stable\bin;%ROOT_DIR%\releases\tendou-v0.16.0-stable\bin;%ROOT_DIR%\releases\tendou-v0.15.0-stable\bin;%ROOT_DIR%\releases\tendou-v0.14.0-stable\bin"
+if defined CUDA_PATH if exist "%CUDA_PATH%\bin" set "EXTRA_PATH=%EXTRA_PATH%;%CUDA_PATH%\bin"
+if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin" set "EXTRA_PATH=%EXTRA_PATH%;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin"
+if exist "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin" set "EXTRA_PATH=%EXTRA_PATH%;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin"
+set "PATH=%EXTRA_PATH%;%PATH%"
 
-set "TENDOU_PHYSICAL_MAP=config\atlas_physical_map_35b.json"
+:: Runtime threading & CUDA host registration defaults (1:1 parity with start_server.sh)
+if not defined GGML_CUDA_REGISTER_HOST set "GGML_CUDA_REGISTER_HOST=1"
+if not defined OMP_PROC_BIND set "OMP_PROC_BIND=close"
+if not defined OMP_PLACES set "OMP_PLACES=cores"
 
-set "MODEL_PATH=C:\Users\Ali\.cache\huggingface\hub\models--unsloth--Qwen3.6-35B-A3B-GGUF\snapshots\a483e9e6cbd595906af30beda3187c2663a1118c\Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
-set "PYTHON=.venv-audit\Scripts\python.exe"
+:: Resolve Python interpreter (.venv-audit -> .venv -> system python)
+set "PYTHON_BIN="
+if exist "%ROOT_DIR%\.venv-audit\Scripts\python.exe" (
+    set "PYTHON_BIN=%ROOT_DIR%\.venv-audit\Scripts\python.exe"
+) else if exist "%ROOT_DIR%\.venv\Scripts\python.exe" (
+    set "PYTHON_BIN=%ROOT_DIR%\.venv\Scripts\python.exe"
+) else (
+    set "PYTHON_BIN=python"
+)
 
-echo ============================================================
-echo   TENDOU LAUNCHER - LOCAL OPENAI-COMPATIBLE API SERVER
-echo ============================================================
-echo   Model       : Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf
-echo   Context Max : 262,144 tokens (256k Full Native Context)
-echo   Threads     : 16 CPU Threads (Ryzen 7 260 Peak Throughput)
-echo   GPU / VRAM  : 2 Dense Layers + 3000 MB Dynamic Expert Cache
-echo   KV Cache    : Q4_0 Quantized (11.25 KB/tok, Ultra-Low VRAM)
-echo   Engine Mode : Boost Mode (Adaptive K=5 Pruning, 32-40 TPS)
-echo   Server URL  : http://127.0.0.1:8000/v1
-echo ============================================================
+echo ============================================================================
+echo   TENDOU LAUNCHER v0.16.3-stable — TENDOU STUDIO + OPENAI/ANTHROPIC API
+echo   Web UI : http://127.0.0.1:8000
+echo   API    : http://127.0.0.1:8000/v1  ^|  /v1/messages
+echo   Python : %PYTHON_BIN%
+echo ============================================================================
 echo.
 
-%PYTHON% atlas_server.py ^
-  --model-path "%MODEL_PATH%" ^
-  --threads 16 ^
-  --gpu-layers 2 ^
-  --vram-cache 3000 ^
-  --ctx-size 262144 ^
-  --cache-type-k q4_0 ^
-  --cache-type-v q4_0 ^
-  --prompt-cache-mb 256 ^
-  --boost ^
-  --cuda-sched yield ^
-  --odmoe-lead 2 ^
-  --spice-conf-high 0.65 ^
-  --spice-conf-mid 0.30 ^
-  --prefetch-candidates 10 ^
-  --tutti-queue-depth 64 ^
-  --readback-interval 8 ^
-  --port 8000 ^
-  --force
-
-pause
+"%PYTHON_BIN%" "%ROOT_DIR%\atlas_server.py" %*
+exit /b %errorlevel%

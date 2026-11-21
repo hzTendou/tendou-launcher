@@ -1,0 +1,5 @@
+set(TARGET llama-atlas-engine)
+add_executable(${TARGET} atlas-engine.cpp atlas-engine.h)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama-common llama ggml ggml-base ggml-cpu ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

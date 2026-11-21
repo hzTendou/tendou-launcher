@@ -32,6 +32,7 @@ from src.atlas.server import (
     DEFAULT_EXE_PATH,
 )
 from src.atlas.autotune import (
+    compute_auto_plan,
     probe_hardware,
     inspect_model_topology,
     solve_optimal_configuration,
@@ -41,19 +42,27 @@ from src.atlas.autotune import (
 logger = logging.getLogger("benchmark.agentic_protocols")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-MODEL_QWEN36 = Path(
-    r"C:\Users\Ali\.cache\huggingface\hub\models--unsloth--Qwen3.6-35B-A3B-GGUF\snapshots\a483e9e6cbd595906af30beda3187c2663a1118c\Qwen3.6-35B-A3B-UD-IQ4_XS.gguf"
-)
-MODEL_QWEN38 = Path(
-    r"C:\Users\Ali\WebProjects\tendou-launcher\models\qwen3.8-gsq-rco-iq3_xxs\IQ3_XXS\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
-)
+def _resolve_qwen36_path() -> Path:
+    rel = Path("models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-IQ4_XS.gguf")
+    candidates = (
+        [Path(r"C:\Users\Ali\.cache\huggingface\hub") / rel, Path.home() / ".cache" / "huggingface" / "hub" / rel]
+        if os.name == "nt"
+        else [Path("/mnt/Ortak/huggingface/hub") / rel, Path.home() / ".cache" / "huggingface" / "hub" / rel]
+    )
+    for c in candidates:
+        if c.is_file():
+            return c
+    return candidates[0]
+
+MODEL_QWEN36 = _resolve_qwen36_path()
+MODEL_QWEN38 = ROOT / "models" / "qwen3.8-gsq-rco-iq3_xxs" / "IQ3_XXS" / "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
 MODEL_QWEN122 = ROOT / "models" / "MXFP4_MOE" / "Qwen3.5-122B-A10B-MXFP4_MOE-00001-of-00003.gguf"
-ENGINE_V14 = ROOT / "releases" / "tendou-v0.14.0-stable" / "bin" / "tendou-engine.exe"
+ENGINE_V14 = ROOT / "releases" / "tendou-v0.14.0-stable" / "bin" / ("tendou-engine.exe" if os.name == "nt" else "tendou-engine")
 
 
 def get_cuda_vram_info() -> Tuple[float, float, float]:
     try:
-        nvml = ctypes.CDLL("nvml.dll")
+        nvml = ctypes.CDLL("nvml.dll" if os.name == "nt" else "libnvidia-ml.so.1")
         nvml.nvmlInit_v2()
         handle = ctypes.c_void_p()
         nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle))
@@ -66,7 +75,6 @@ def get_cuda_vram_info() -> Tuple[float, float, float]:
         free_mib = mem.free / (1024.0 * 1024.0)
         total_mib = mem.total / (1024.0 * 1024.0)
         used_mib = mem.used / (1024.0 * 1024.0)
-        nvml.nvmlShutdown()
         return free_mib, total_mib, used_mib
     except Exception:
         return 0.0, 0.0, 0.0
@@ -506,16 +514,22 @@ def launch_server_instance(
     extra_args: List[str],
     prompt_cache_mb: int = 512,
     moe_cache_mib: int = 2048,
+    ctx_size: int = 8192,
+    boost: bool = True,
+    fp8_kv: Optional[bool] = None,
 ) -> Tuple[AtlasSubprocessBackend, uvicorn.Server, threading.Thread, str]:
     backend = AtlasSubprocessBackend(
         exe_path=str(exe_path),
         model_path=str(model_path),
         threads=threads,
         gpu_layers=gpu_layers,
+        ctx_size=ctx_size,
         cache_type_v=None,
         mtp=mtp_mode,
         mtp_draft_n=mtp_draft_n,
+        boost=boost,
         boost_level=2,
+        fp8_kv=fp8_kv,
         prompt_cache_mb=prompt_cache_mb,
         moe_cache_mib=moe_cache_mib,
         extra_args=extra_args,
@@ -558,13 +572,15 @@ def launch_server_instance(
 
 
 def stop_server_instance(backend: AtlasSubprocessBackend, server: uvicorn.Server) -> None:
+    server.should_exit = True
+    time.sleep(1.5)
     try:
-        import asyncio
-        asyncio.run(backend.stop())
+        proc = getattr(backend, "proc", None) or getattr(backend, "_proc", None)
+        if proc is not None and proc.returncode is None:
+            proc.terminate()
     except Exception:
         pass
-    server.should_exit = True
-    time.sleep(2.0)  # Allow Windows WDDM driver to reclaim GPU VRAM cleanly
+    time.sleep(1.0)
 
 
 def run_benchmark_for_model(
@@ -572,6 +588,9 @@ def run_benchmark_for_model(
     model_path: Path,
     exe_path: Path,
     physical_map: Optional[Path] = None,
+    boost: bool = True,
+    fp8_kv: Optional[bool] = None,
+    use_auto_plan: bool = False,
 ) -> Dict[str, Any]:
     logger.info("=" * 80)
     logger.info(f"STARTING DUAL-PROTOCOL BENCHMARK: {model_name.upper()}")
@@ -580,7 +599,12 @@ def run_benchmark_for_model(
 
     hw = probe_hardware()
     topo = inspect_model_topology(model_path)
-    plan = solve_optimal_configuration(hw, topo)
+    if use_auto_plan:
+        plan = compute_auto_plan(hw, topo, ctx_size=8192, explicit_fp8_kv=fp8_kv)
+        wl_base_mtp = "pld"
+    else:
+        plan = solve_optimal_configuration(hw, topo)
+        wl_base_mtp = plan.mtp_mode
 
     extra_args = []
     map_to_use = physical_map or (Path(plan.physical_map_path) if plan.physical_map_path else None)
@@ -593,6 +617,8 @@ def run_benchmark_for_model(
     else:
         # Use native layer-aware prefill sparsity (Top-2 on reasoning/output layers, Top-1 on outer layers)
         os.environ.pop("ATLAS_PREFILL_TOP_K", None)
+        os.environ.pop("ATLAS_CPU_SPEC_K", None)
+        os.environ.pop("ATLAS_MTP_UNION_CAP", None)
 
     current_backend = None
     current_server = None
@@ -607,7 +633,7 @@ def run_benchmark_for_model(
     try:
         for wl in WORKLOADS:
             target_mtp, target_draft_n, rationale = solve_workload_speculative_policy(
-                wl["prompt"], category=wl["category"], tools=wl.get("tools"), base_mtp_mode=plan.mtp_mode
+                wl["prompt"], category=wl["category"], tools=wl.get("tools"), base_mtp_mode=wl_base_mtp
             )
 
             if current_backend is None or current_mtp != target_mtp or current_draft_n != target_draft_n:
@@ -626,6 +652,9 @@ def run_benchmark_for_model(
                     extra_args=extra_args,
                     prompt_cache_mb=getattr(plan, "prompt_cache_mb", 512),
                     moe_cache_mib=getattr(plan, "moe_cache_mib", 2048),
+                    ctx_size=getattr(plan, "ctx_size", 8192),
+                    boost=boost,
+                    fp8_kv=fp8_kv,
                 )
                 current_mtp = target_mtp
                 current_draft_n = target_draft_n
@@ -764,27 +793,42 @@ def run_benchmark_for_model(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tendou Launcher v0.14.0-stable Dual-Protocol Agentic Benchmark")
+    parser = argparse.ArgumentParser(description="Tendou Launcher Dual-Protocol Agentic Benchmark")
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "docs" / "json" / "benchmark_v14_claude_code_and_opencode_report.json",
+        default=ROOT / "docs" / "json" / "benchmark_v16_kubuntu_report.json",
     )
     parser.add_argument("--model", choices=["all", "35b", "38b", "122b"], default="all")
+    parser.add_argument("--engine", type=Path, default=Path(DEFAULT_EXE_PATH))
+    parser.add_argument("--version", type=str, default="0.16.0-stable")
+    parser.add_argument("--boost", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fp8-kv", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--auto-plan", action="store_true", default=False, help="Use v0.16.2 compute_auto_plan")
     args = parser.parse_args()
 
+    exe_path = args.engine if args.engine.is_absolute() else (ROOT / args.engine)
+
     print("================================================================================")
-    print("TENDOU LAUNCHER v0.14.0-STABLE DUAL-PROTOCOL AGENTIC BENCHMARK")
-    print("OpenCode (/v1/chat/completions) & Claude Code (/v1/messages) Comparative Audit")
+    print(f"TENDOU LAUNCHER {args.version.upper()} DUAL-PROTOCOL AGENTIC BENCHMARK")
+    print("OpenCode (/v1/chat/completions), Claude Code (/v1/messages) & Cline Audit")
     print("================================================================================\n")
 
     hw = probe_hardware()
     print(f"Hardware Detected: {hw.gpu_name} (8.12 GB GDDR6) | AMD Ryzen 7 260 | {hw.ram_total_gb:.1f} GB RAM\n")
 
+    try:
+        engine_rel = str(exe_path.resolve().relative_to(ROOT.resolve()))
+    except Exception:
+        engine_rel = str(exe_path)
+
     benchmark_report: Dict[str, Any] = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "version": "0.14.0-stable",
-        "engine": str(ENGINE_V14.relative_to(ROOT)),
+        "version": args.version,
+        "engine": engine_rel,
+        "boost": args.boost,
+        "fp8_kv": args.fp8_kv,
+        "auto_plan": args.auto_plan,
         "hardware": asdict(hw),
         "results": {},
     }
@@ -802,8 +846,11 @@ def main():
         res_35b = run_benchmark_for_model(
             model_name="qwen3.6-35b-a3b",
             model_path=MODEL_QWEN36,
-            exe_path=ENGINE_V14,
+            exe_path=exe_path,
             physical_map=q36_map,
+            boost=args.boost,
+            fp8_kv=args.fp8_kv,
+            use_auto_plan=args.auto_plan,
         )
         benchmark_report["results"]["qwen3.6-35b-a3b"] = res_35b
 
@@ -812,8 +859,11 @@ def main():
         res_38b = run_benchmark_for_model(
             model_name="qwen3.8-flash-next",
             model_path=MODEL_QWEN38,
-            exe_path=ENGINE_V14,
+            exe_path=exe_path,
             physical_map=ROOT / "config" / "atlas_physical_map_qwen38_iq3xxs.json",
+            boost=args.boost,
+            fp8_kv=args.fp8_kv,
+            use_auto_plan=args.auto_plan,
         )
         benchmark_report["results"]["qwen3.8-flash-next"] = res_38b
 
@@ -822,8 +872,11 @@ def main():
         res_122b = run_benchmark_for_model(
             model_name="qwen3.5-122b-a10b-mxfp4",
             model_path=MODEL_QWEN122,
-            exe_path=ENGINE_V14,
+            exe_path=exe_path,
             physical_map=ROOT / "config" / "atlas_physical_map_122b_mxfp4.json",
+            boost=args.boost,
+            fp8_kv=args.fp8_kv,
+            use_auto_plan=args.auto_plan,
         )
         benchmark_report["results"]["qwen3.5-122b-a10b-mxfp4"] = res_122b
 

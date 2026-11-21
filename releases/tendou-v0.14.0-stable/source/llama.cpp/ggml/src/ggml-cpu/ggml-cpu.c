@@ -39,8 +39,9 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
-#if defined(__gnu_linux__)
+#if defined(__gnu_linux__) || defined(__linux__)
 #include <syscall.h>
+#include <sys/mman.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -1354,26 +1355,16 @@ UseGgmlGemm1:;
             }
         }
     #else
-        if (ne11 <= 2 && ne12 == 1 && ne13 == 1) {
-            if (ith == 0) {
+        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    from_float((float *)((char *) src1->data + i11*nb11),
-                               (void *)               (wdata + i11*nbw1),
-                                ne10);
+                    size_t bs = ggml_blck_size(vec_dot_type);
+                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               (ne10_block_end - ne10_block_start) * bs);
                 }
-            }
-        } else {
-            const int64_t total_rows = ne11 * ne12 * ne13;
-            const int64_t r_begin = (int64_t) ith * total_rows / nth;
-            const int64_t r_end   = (int64_t) (ith + 1) * total_rows / nth;
-            for (int64_t r = r_begin; r < r_end; ++r) {
-                int64_t rem = r;
-                int64_t i11 = rem % ne11; rem /= ne11;
-                int64_t i12 = rem % ne12; rem /= ne12;
-                int64_t i13 = rem;
-                from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                           (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                           ne10);
             }
         }
     #endif
@@ -1531,7 +1522,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
 #if defined(__x86_64__) || defined(_M_X64)
             for (size_t po = 0; po < row_size; po += 64) {
-                _mm_prefetch((const char *)src1_col + po, _MM_HINT_NTA);
+                _mm_prefetch((const char *)src1_col + po, _MM_HINT_T0);
             }
 #endif
 
@@ -1541,7 +1532,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
 #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1587,7 +1578,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
 #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1633,7 +1624,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
 #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1679,7 +1670,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
 #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1710,6 +1701,34 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 for (; row < ir0_end; ++row) {
                     ggml_vec_dot_iq3_xxs_q8_K_vnni(ne00, &dst_col[row], 0, src0_cur + (size_t) row * nb01, 0, src1_col, 0, 1);
                 }
+            } else if (type == GGML_TYPE_MXFP4) {
+                int64_t row = ir0_start;
+#if defined(__x86_64__) || defined(_M_X64)
+                const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
+                const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
+                for (size_t po = 0; po < init_len; po += 64) {
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
+                }
+#endif
+                for (; row + 7 < ir0_end; row += 8) {
+#if defined(__x86_64__) || defined(_M_X64)
+                    if (row + 15 < ir0_end) {
+                        const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
+                        const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (ir0_end - row - 8) * nb01);
+                        for (size_t po = 0; po < pf_len; po += 64) {
+                            _mm_prefetch(p_ahead + po, _MM_HINT_T1);
+                        }
+                    }
+#endif
+                    ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_col[row + 0], sizeof(float), src0_cur + (size_t) (row + 0) * nb01, nb01, src1_col, 0, 4);
+                    ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_col[row + 4], sizeof(float), src0_cur + (size_t) (row + 4) * nb01, nb01, src1_col, 0, 4);
+                }
+                for (; row + 3 < ir0_end; row += 4) {
+                    ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_col[row], sizeof(float), src0_cur + (size_t) row * nb01, nb01, src1_col, 0, 4);
+                }
+                for (; row < ir0_end; ++row) {
+                    ggml_vec_dot_mxfp4_q8_0(ne00, &dst_col[row], 0, src0_cur + (size_t) row * nb01, 0, src1_col, 0, 1);
+                }
             } else if (type == GGML_TYPE_F32) {
                 for (int64_t row = ir0_start; row < ir0_end; ++row) {
                     ggml_vec_dot_f32(ne00, &dst_col[row], 0, (const float *)(src0_cur + (size_t) row * nb01), 0, (const float *)src1_col, 0, 1);
@@ -1739,7 +1758,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 dst_ptrs[t] = (float *) ((char *) dst->data + (id_t*nb1 + i12_t*nb2));
     #if defined(__x86_64__) || defined(_M_X64)
                 for (size_t po = 0; po < row_size; po += 64) {
-                    _mm_prefetch(src1_ptrs[t] + po, _MM_HINT_NTA);
+                    _mm_prefetch(src1_ptrs[t] + po, _MM_HINT_T0);
                 }
     #endif
             }
@@ -1750,7 +1769,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
     #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1782,7 +1801,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
     #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1814,7 +1833,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
     #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1846,7 +1865,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
                 const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
                 for (size_t po = 0; po < init_len; po += 64) {
-                    _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                 }
 #endif
                 for (; row + 7 < ir0_end; row += 8) {
@@ -1899,6 +1918,67 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                     }
                     for (; t < max_t; ++t) {
                         ggml_vec_dot_iq3_xxs_q8_K_vnni(ne00, &dst_ptrs[t][row], 0, w_row, 0, src1_ptrs[t], 0, 1);
+                    }
+                }
+            } else if (type == GGML_TYPE_MXFP4) {
+                int64_t row = ir0_start;
+#if defined(__x86_64__) || defined(_M_X64)
+                const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (ir0_end - ir0_start) * nb01);
+                const char * init_ptr = src0_cur + (size_t) ir0_start * nb01;
+                for (size_t po = 0; po < init_len; po += 64) {
+                    _mm_prefetch(init_ptr + po, _MM_HINT_T0);
+                }
+#endif
+                for (; row + 7 < ir0_end; row += 8) {
+#if defined(__x86_64__) || defined(_M_X64)
+                    if (row + 15 < ir0_end) {
+                        const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
+                        const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (ir0_end - row - 8) * nb01);
+                        for (size_t po = 0; po < pf_len; po += 64) {
+                            _mm_prefetch(p_ahead + po, _MM_HINT_T1);
+                        }
+                    }
+#endif
+                    for (int r = 0; r < 8; ++r) {
+                        const char * w_row = src0_cur + (size_t) (row + r) * nb01;
+                        int64_t t = 0;
+                        for (; t + 1 < max_t; t += 2) {
+                            float s2[2];
+                            ggml_vec_dot_mxfp4_q8_0_nrc2(ne00, s2, sizeof(float), w_row, 0, src1_ptrs[t], (const char *)src1_ptrs[t+1] - (const char *)src1_ptrs[t], 2);
+                            dst_ptrs[t + 0][row + r] = s2[0];
+                            dst_ptrs[t + 1][row + r] = s2[1];
+                        }
+                        for (; t < max_t; ++t) {
+                            ggml_vec_dot_mxfp4_q8_0(ne00, &dst_ptrs[t][row + r], 0, w_row, 0, src1_ptrs[t], 0, 1);
+                        }
+                    }
+                }
+                for (; row + 3 < ir0_end; row += 4) {
+                    for (int r = 0; r < 4; ++r) {
+                        const char * w_row = src0_cur + (size_t) (row + r) * nb01;
+                        int64_t t = 0;
+                        for (; t + 1 < max_t; t += 2) {
+                            float s2[2];
+                            ggml_vec_dot_mxfp4_q8_0_nrc2(ne00, s2, sizeof(float), w_row, 0, src1_ptrs[t], (const char *)src1_ptrs[t+1] - (const char *)src1_ptrs[t], 2);
+                            dst_ptrs[t + 0][row + r] = s2[0];
+                            dst_ptrs[t + 1][row + r] = s2[1];
+                        }
+                        for (; t < max_t; ++t) {
+                            ggml_vec_dot_mxfp4_q8_0(ne00, &dst_ptrs[t][row + r], 0, w_row, 0, src1_ptrs[t], 0, 1);
+                        }
+                    }
+                }
+                for (; row < ir0_end; ++row) {
+                    const char * w_row = src0_cur + (size_t) row * nb01;
+                    int64_t t = 0;
+                    for (; t + 1 < max_t; t += 2) {
+                        float s2[2];
+                        ggml_vec_dot_mxfp4_q8_0_nrc2(ne00, s2, sizeof(float), w_row, 0, src1_ptrs[t], (const char *)src1_ptrs[t+1] - (const char *)src1_ptrs[t], 2);
+                        dst_ptrs[t + 0][row] = s2[0];
+                        dst_ptrs[t + 1][row] = s2[1];
+                    }
+                    for (; t < max_t; ++t) {
+                        ggml_vec_dot_mxfp4_q8_0(ne00, &dst_ptrs[t][row], 0, w_row, 0, src1_ptrs[t], 0, 1);
                     }
                 }
             } else if (type == GGML_TYPE_F32) {
@@ -1977,9 +2057,6 @@ static void atlas_init_gpu_slot_lut(void) {
         for (int e = 0; e < 512; ++e) {
             g_atlas_gpu_slot_lut[l][e] = -1;
         }
-        for (int s = 0; s < 21; ++s) {
-            g_atlas_gpu_slot_lut[l][s] = (int16_t) s;
-        }
     }
     g_atlas_gpu_slot_lut_inited = 1;
 }
@@ -2002,12 +2079,26 @@ static inline int ggml_cpu_get_keep_k(const struct ggml_tensor * src0, int n_ids
             p++;
         }
     }
-    if (layer >= 2 && layer < 48) {
+    if (layer >= 0 && layer < 48) {
+        if (layer < 2) {
+            return MIN(n_ids, 2);
+        }
+        const bool is_122b = (src0->ne[0] == 3072 || src0->ne[1] == 3072);
+        if (is_122b) {
+            if (layer >= 46) {
+                return MIN(n_ids, 2);
+            }
+            if (s_decode_step > 48 && layer >= 20 && layer <= 25) {
+                return MIN(n_ids, 2);
+            }
+            return MIN(n_ids, 1);
+        }
         static int s_reasoning_k = -1;
         if (s_reasoning_k < 0) {
             const char * env_rk = getenv("ATLAS_REASONING_K");
             s_reasoning_k = (env_rk && env_rk[0] >= '1') ? (env_rk[0] - '0') : 4;
         }
+        const int eff_reasoning_k = s_reasoning_k;
         if (g_atlas_dyn_k == 2) {
             // Level 2 Turbo: Multi-expert capacity on reasoning & arithmetic layers 15-30 (calibrated K=4), 37-39, and output layers 44-47.
             // Outer layers (2-14, 31-36, 40-43) execute top-1 expert only, eliminating 25 full expert layers while
@@ -2018,7 +2109,7 @@ static inline int ggml_cpu_get_keep_k(const struct ggml_tensor * src0, int n_ids
                 if (adapt_k > 0) {
                     return MIN(n_ids, adapt_k);
                 }
-                return MIN(n_ids, s_reasoning_k);
+                return MIN(n_ids, eff_reasoning_k);
             } else if ((layer >= 44) || (layer >= 37 && layer < 40)) {
                 return MIN(n_ids, 2);
             } else {
@@ -2032,7 +2123,7 @@ static inline int ggml_cpu_get_keep_k(const struct ggml_tensor * src0, int n_ids
                 if (adapt_k > 0) {
                     return MIN(n_ids, adapt_k);
                 }
-                return MIN(n_ids, s_reasoning_k);
+                return MIN(n_ids, eff_reasoning_k);
             } else if (layer >= 44) {
                 return MIN(n_ids, 2);
             } else {
@@ -2046,7 +2137,7 @@ static inline int ggml_cpu_get_keep_k(const struct ggml_tensor * src0, int n_ids
                 if (adapt_k > 0) {
                     return MIN(n_ids, adapt_k);
                 }
-                return MIN(n_ids, s_reasoning_k);
+                return MIN(n_ids, eff_reasoning_k);
             } else if ((layer >= 44) || (layer >= 37 && layer < 40)) {
                 return MIN(n_ids, 2);
             } else {
@@ -2067,16 +2158,28 @@ static inline int ggml_cpu_get_keep_k_prefill(const struct ggml_tensor * src0, i
             p++;
         }
     }
-    if (layer >= 2 && layer < 48) {
-        const char * inc_env = getenv("ATLAS_INCREMENTAL_SUFFIX");
-        if (inc_env && inc_env[0] == '1') {
-            // Incremental suffix prefill hot path following prompt cache hit:
-            // Suffix tokens only need core reasoning experts (K=2) and output experts (K=2).
-            if ((layer >= 18 && layer <= 30) || (layer >= 44)) {
-                return MIN(n_ids, 2);
-            } else {
-                return MIN(n_ids, 1);
+    if (layer >= 0 && layer < 48) {
+        if (g_atlas_layer_adaptive_k[layer] > 0) {
+            return MIN(n_ids, g_atlas_layer_adaptive_k[layer]);
+        }
+        static int s_pf_k_cap = -2;
+        if (s_pf_k_cap == -2) {
+            const char * pf_k_env = getenv("ATLAS_PREFILL_TOP_K");
+            s_pf_k_cap = (pf_k_env && pf_k_env[0] != '\0') ? atoi(pf_k_env) : 0;
+        }
+        if (s_pf_k_cap > 0 && s_pf_k_cap < n_ids) {
+            const bool is_122b = (src0->ne[0] == 3072 || src0->ne[1] == 3072);
+            if (is_122b && s_pf_k_cap == 2) {
+                if (layer >= 2 && layer <= 45) {
+                    return 1;
+                }
             }
+            return s_pf_k_cap;
+        }
+        // Safe default prefill expert pruning cap (Top-4) to preserve full schema comprehension
+        // while eliminating 10-expert disk page thrashing.
+        if (n_ids > 4) {
+            return 4;
         }
     }
     return n_ids;
@@ -2097,8 +2200,15 @@ static void ggml_compute_forward_mul_mat_id(
 
     extern void (*g_atlas_record_cpu_moe_us)(int layer, int64_t start_us, int64_t duration_us, uint64_t logical_bytes);
     extern void (*g_atlas_record_moe_experts)(int layer, int n_ids, const int32_t * ids, int is_decode);
+    extern void (*g_atlas_signal_lookahead_preduction)(int layer, const void * cur_hidden);
 
     if (ith == 0) {
+        if (g_atlas_signal_lookahead_preduction && src1 && src1->data && strstr(src0->name, "gate") != NULL) {
+            int cur_l = atlas_parse_moe_layer(src0->name);
+            if (cur_l >= 0 && cur_l < 46) {
+                g_atlas_signal_lookahead_preduction(cur_l, src1->data);
+            }
+        }
         if (!g_atlas_is_decode || (ids && ids->ne[1] > 1)) {
             s_decode_step = 0;
             for (int l = 0; l < 48; ++l) {
@@ -2110,7 +2220,8 @@ static void ggml_compute_forward_mul_mat_id(
                 int layer = atlas_parse_moe_layer(src0->name);
                 if (layer == 2) {
                     s_decode_step++;
-                    int k_reasoning = (s_decode_step <= 2) ? 4 : 2;
+                    const bool is_122b = (src0->ne[0] == 3072 || src0->ne[1] == 3072);
+                    int k_reasoning = (!is_122b && s_decode_step <= 2) ? 4 : 2;
                     for (int l = 15; l <= 30; ++l) {
                         g_atlas_layer_adaptive_k[l] = k_reasoning;
                     }
@@ -2120,10 +2231,14 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0 && g_atlas_record_moe_experts && ids && ids->data) {
-        bool is_gate = (strstr(src0->name, "gate") != NULL);
-        if (is_gate || (strstr(src0->name, "up") == NULL && strstr(src0->name, "down") == NULL)) {
-            int layer = atlas_parse_moe_layer(src0->name);
-            if (layer >= 0 && layer < 48) {
+        static int s_last_record_layer = -1;
+        int layer = atlas_parse_moe_layer(src0->name);
+        if (layer >= 0 && layer < 48) {
+            bool is_first_moe_tensor = (strstr(src0->name, "up") != NULL && strstr(src0->name, "gate") == NULL) ||
+                                      (strstr(src0->name, "gate_up") != NULL) ||
+                                      (strstr(src0->name, "gate") != NULL && strstr(src0->name, "up") == NULL);
+            if (is_first_moe_tensor || layer != s_last_record_layer) {
+                s_last_record_layer = layer;
                 if (g_atlas_is_decode && ids->ne[1] == 1) {
                     const int keep_k = ggml_cpu_get_keep_k(src0, (int)ids->ne[0]);
                     g_atlas_record_moe_experts(layer, keep_k, (const int32_t *)ids->data, 1);
@@ -2214,10 +2329,60 @@ static void ggml_compute_forward_mul_mat_id(
 
         if (ne11 <= 2 && ne12 == 1 && ne13 == 1) {
             if (ith == 0) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    from_float((float *)((char *) src1->data + i11*nb11),
-                               (void *)               (wdata + i11*nbw1),
-                                ne10);
+                // Step 4.2: Tendou Shared Gate+Up Activation Quantization Cache
+                // During single-token decode (ne11 == 1), ffn_gate_exps and ffn_up_exps share the exact same
+                // src1 activation vector and write to the same wdata scratch buffer without modifying wdata.
+                static const void * s_last_src1_ptr = NULL;
+                static const void * s_last_wdata_ptr = NULL;
+                static int          s_last_vec_dot_type = -1;
+                static int64_t      s_last_ne10 = 0;
+                static uint64_t     s_last_src1_fp = 0;
+                static uint64_t     s_last_wdata_fp = 0;
+
+                int quant_cached = 0;
+                uint64_t cur_src1_fp = 1469598103934665603ULL;
+                if (ne11 == 1 && ne10 >= 64 && nbw1 >= 64) {
+                    const uint64_t * s64 = (const uint64_t *) src1->data;
+                    const size_t n_u64 = ((size_t) ne10 * sizeof(float)) / sizeof(uint64_t);
+                    const size_t step = (n_u64 >= 16) ? (n_u64 / 16) : 1;
+                    for (size_t k = 0; k < n_u64; k += step) {
+                        cur_src1_fp = (cur_src1_fp ^ s64[k]) * 1099511628211ULL;
+                    }
+                    cur_src1_fp = (cur_src1_fp ^ s64[n_u64 - 1]) * 1099511628211ULL;
+
+                    uint64_t cur_wdata_fp = 1469598103934665603ULL;
+                    const uint64_t * w64 = (const uint64_t *) wdata;
+                    const size_t nw_u64 = nbw1 / sizeof(uint64_t);
+                    cur_wdata_fp = (cur_wdata_fp ^ w64[0] ^ w64[1] ^ w64[nw_u64 / 2] ^ w64[nw_u64 - 1]) * 1099511628211ULL;
+
+                    if (s_last_src1_ptr == src1->data &&
+                        s_last_wdata_ptr == wdata &&
+                        s_last_vec_dot_type == (int) vec_dot_type &&
+                        s_last_ne10 == ne10 &&
+                        s_last_src1_fp == cur_src1_fp &&
+                        s_last_wdata_fp == cur_wdata_fp) {
+                        quant_cached = 1;
+                    }
+                }
+
+                if (!quant_cached) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                        from_float((float *)((char *) src1->data + i11*nb11),
+                                   (void *)               (wdata + i11*nbw1),
+                                    ne10);
+                    }
+                    if (ne11 == 1 && ne10 >= 64 && nbw1 >= 64) {
+                        const uint64_t * w64 = (const uint64_t *) wdata;
+                        const size_t nw_u64 = nbw1 / sizeof(uint64_t);
+                        uint64_t new_wdata_fp = 1469598103934665603ULL;
+                        new_wdata_fp = (new_wdata_fp ^ w64[0] ^ w64[1] ^ w64[nw_u64 / 2] ^ w64[nw_u64 - 1]) * 1099511628211ULL;
+                        s_last_src1_ptr = src1->data;
+                        s_last_wdata_ptr = wdata;
+                        s_last_vec_dot_type = (int) vec_dot_type;
+                        s_last_ne10 = ne10;
+                        s_last_src1_fp = cur_src1_fp;
+                        s_last_wdata_fp = new_wdata_fp;
+                    }
                 }
             }
             if (ne11 > 1) {
@@ -2251,39 +2416,101 @@ static void ggml_compute_forward_mul_mat_id(
             int skipped_slots[64];
             int n_skipped = 0;
 
-            const int keep_k = g_atlas_is_decode ? ggml_cpu_get_keep_k(src0, (int) n_ids) : (int) n_ids;
+            const int keep_k = g_atlas_is_decode ? ggml_cpu_get_keep_k(src0, (int) n_ids) : ggml_cpu_get_keep_k_prefill(src0, (int) n_ids);
             const int layer = atlas_parse_moe_layer(src0->name);
+            const int bypass_gpu = (!g_atlas_is_decode || ne00 == 3072 || ne01 == 3072) ? 1 : 0;
 
             atlas_init_gpu_slot_lut();
 
+            // Step 4.3: Thread-Local Monotonic Slot Sorting Cache across gate_exps, up_exps, and down_exps
+#if defined(_MSC_VER)
+            static __declspec(thread) const void * tls_ids_ptr = NULL;
+            static __declspec(thread) int64_t      tls_n_ids = 0;
+            static __declspec(thread) int64_t      tls_n_as = 0;
+            static __declspec(thread) int          tls_layer = -2;
+            static __declspec(thread) int          tls_keep_k = -1;
+            static __declspec(thread) int          tls_is_decode = -1;
+            static __declspec(thread) int          tls_bypass_gpu = -1;
+            static __declspec(thread) uint64_t     tls_ids_fp = 0;
+            static __declspec(thread) int          tls_n_active = 0;
+            static __declspec(thread) int          tls_n_skipped = 0;
+            static __declspec(thread) int          tls_active_slots[64];
+            static __declspec(thread) int          tls_skipped_slots[64];
+#else
+            static __thread const void * tls_ids_ptr = NULL;
+            static __thread int64_t      tls_n_ids = 0;
+            static __thread int64_t      tls_n_as = 0;
+            static __thread int          tls_layer = -2;
+            static __thread int          tls_keep_k = -1;
+            static __thread int          tls_is_decode = -1;
+            static __thread int          tls_bypass_gpu = -1;
+            static __thread uint64_t     tls_ids_fp = 0;
+            static __thread int          tls_n_active = 0;
+            static __thread int          tls_n_skipped = 0;
+            static __thread int          tls_active_slots[64];
+            static __thread int          tls_skipped_slots[64];
+#endif
+            uint64_t cur_ids_fp = 1469598103934665603ULL;
             for (int id = 0; id < (int)n_ids; ++id) {
-                const int32_t expert_id = *(const int32_t *) ((const char *) ids->data + id * ids->nb[0]);
-                if (id < keep_k && expert_id >= 0 && expert_id < n_as) {
-                    const int16_t slot = (g_atlas_is_decode && layer >= 0 && layer < 48 && expert_id < 512) ? g_atlas_gpu_slot_lut[layer][expert_id] : -1;
-                    if (id == 0 || layer >= 44 || slot == -1 || (layer >= 15 && layer <= 30) || !g_atlas_is_decode) {
-                        active_slots[n_active++] = id;
-                    } else {
-                        // Slot >= 0: VRAM-resident hot expert dispatched to GPU stream (E_GPU)
-                        skipped_slots[n_skipped++] = id;
-                    }
-                } else {
-                    skipped_slots[n_skipped++] = id;
-                }
+                const int32_t eid = *(const int32_t *) ((const char *) ids->data + id * ids->nb[0]);
+                cur_ids_fp = (cur_ids_fp ^ (uint64_t)(uint32_t)eid) * 1099511628211ULL;
             }
 
-            // Sort active_slots by expert_id so all threads sweep monotonically forward through DDR5 address space,
-            // eliminating DRAM row-buffer misses, bank thrashing, and maximizing Zen 4 stream prefetch throughput.
-            for (int i = 1; i < n_active; ++i) {
-                int key_slot = active_slots[i];
-                int32_t key_eid = *(const int32_t *) ((const char *) ids->data + key_slot * ids->nb[0]);
-                int j = i - 1;
-                while (j >= 0) {
-                    int32_t j_eid = *(const int32_t *) ((const char *) ids->data + active_slots[j] * ids->nb[0]);
-                    if (j_eid <= key_eid) break;
-                    active_slots[j + 1] = active_slots[j];
-                    j--;
+            if (tls_ids_ptr == ids->data &&
+                tls_n_ids == n_ids &&
+                tls_n_as == n_as &&
+                tls_layer == layer &&
+                tls_keep_k == keep_k &&
+                tls_is_decode == g_atlas_is_decode &&
+                tls_bypass_gpu == bypass_gpu &&
+                tls_ids_fp == cur_ids_fp) {
+                n_active = tls_n_active;
+                n_skipped = tls_n_skipped;
+                for (int i = 0; i < n_active; ++i) active_slots[i] = tls_active_slots[i];
+                for (int i = 0; i < n_skipped; ++i) skipped_slots[i] = tls_skipped_slots[i];
+            } else {
+                for (int id = 0; id < (int)n_ids; ++id) {
+                    const int32_t expert_id = *(const int32_t *) ((const char *) ids->data + id * ids->nb[0]);
+                    if (id < keep_k && expert_id >= 0 && expert_id < n_as) {
+                        const int16_t slot = (g_atlas_is_decode && layer >= 0 && layer < 48 && expert_id < 512) ? g_atlas_gpu_slot_lut[layer][expert_id] : -1;
+                        if (bypass_gpu || slot == -1) {
+                            active_slots[n_active++] = id;
+                        } else {
+                            // Slot >= 0: VRAM-resident hot expert dispatched to GPU stream (E_GPU)
+                            skipped_slots[n_skipped++] = id;
+                        }
+                    } else {
+                        skipped_slots[n_skipped++] = id;
+                    }
                 }
-                active_slots[j + 1] = key_slot;
+
+                // Sort active_slots by expert_id so all threads sweep monotonically forward through DDR5 address space,
+                // eliminating DRAM row-buffer misses, bank thrashing, and maximizing Zen 4 stream prefetch throughput.
+                for (int i = 1; i < n_active; ++i) {
+                    int key_slot = active_slots[i];
+                    int32_t key_eid = *(const int32_t *) ((const char *) ids->data + key_slot * ids->nb[0]);
+                    int j = i - 1;
+                    while (j >= 0) {
+                        int32_t j_eid = *(const int32_t *) ((const char *) ids->data + active_slots[j] * ids->nb[0]);
+                        if (j_eid <= key_eid) break;
+                        active_slots[j + 1] = active_slots[j];
+                        j--;
+                    }
+                    active_slots[j + 1] = key_slot;
+                }
+
+                tls_ids_ptr = ids->data;
+                tls_n_ids = n_ids;
+                tls_n_as = n_as;
+                tls_layer = layer;
+                tls_keep_k = keep_k;
+                tls_is_decode = g_atlas_is_decode;
+                tls_bypass_gpu = bypass_gpu;
+                tls_ids_fp = cur_ids_fp;
+                tls_n_active = n_active;
+                tls_n_skipped = n_skipped;
+                for (int i = 0; i < n_active; ++i) tls_active_slots[i] = active_slots[i];
+                for (int i = 0; i < n_skipped; ++i) tls_skipped_slots[i] = skipped_slots[i];
             }
 
             // Zero skipped/pruned slots cooperatively before barrier
@@ -2297,7 +2524,7 @@ static void ggml_compute_forward_mul_mat_id(
 
             if (n_active > 0) {
 #if defined(_WIN32)
-                if (!g_atlas_is_decode && ith == 0 && n_active > 0) {
+                if (ith == 0 && n_active > 0) {
                     static pfn_PrefetchVirtualMemory s_pfnPrefetch_decode = NULL;
                     static int s_pf_decode_inited = 0;
                     if (!s_pf_decode_inited) {
@@ -2311,13 +2538,57 @@ static void ggml_compute_forward_mul_mat_id(
                         GGML_WIN32_MEMORY_RANGE_ENTRY entries[64];
                         const size_t exp_size = (size_t) nb02;
                         const int n_pf = MIN(n_active, 64);
+                        int n_entries = 0;
                         for (int s = 0; s < n_pf; ++s) {
                             const int sid = active_slots[s];
                             const int32_t eid = *(const int32_t *) ((const char *) ids->data + sid * ids->nb[0]);
-                            entries[s].VirtualAddress = (PVOID)((char *) src0->data + (size_t) eid * nb02);
-                            entries[s].NumberOfBytes  = exp_size;
+                            char * cur_ptr = (char *) src0->data + (size_t) eid * nb02;
+                            if (n_entries > 0) {
+                                char * prev_end = (char *) entries[n_entries - 1].VirtualAddress + entries[n_entries - 1].NumberOfBytes;
+                                if (cur_ptr == prev_end || (cur_ptr > prev_end && (size_t)(cur_ptr - prev_end) <= 65536)) {
+                                    entries[n_entries - 1].NumberOfBytes = (size_t)((cur_ptr + exp_size) - (char *) entries[n_entries - 1].VirtualAddress);
+                                    continue;
+                                }
+                            }
+                            if (n_entries < 64) {
+                                entries[n_entries].VirtualAddress = (PVOID) cur_ptr;
+                                entries[n_entries].NumberOfBytes  = exp_size;
+                                n_entries++;
+                            }
                         }
-                        s_pfnPrefetch_decode(GetCurrentProcess(), (ULONG_PTR) n_pf, entries, 0);
+                        if (n_entries > 0) {
+                            s_pfnPrefetch_decode(GetCurrentProcess(), (ULONG_PTR) n_entries, entries, 0);
+                        }
+                    }
+                }
+#elif defined(__linux__)
+                if (ith == 0 && n_active > 0 && !g_atlas_is_decode) {
+                    struct { char * base; size_t len; } entries[64];
+                    const size_t exp_size = (size_t) nb02;
+                    const int n_pf = MIN(n_active, 64);
+                    int n_entries = 0;
+                    for (int s = 0; s < n_pf; ++s) {
+                        const int sid = active_slots[s];
+                        const int32_t eid = *(const int32_t *) ((const char *) ids->data + sid * ids->nb[0]);
+                        char * cur_ptr = (char *) src0->data + (size_t) eid * nb02;
+                        if (n_entries > 0) {
+                            char * prev_end = entries[n_entries - 1].base + entries[n_entries - 1].len;
+                            if (cur_ptr == prev_end || (cur_ptr > prev_end && (size_t)(cur_ptr - prev_end) <= 65536)) {
+                                entries[n_entries - 1].len = (size_t)((cur_ptr + exp_size) - entries[n_entries - 1].base);
+                                continue;
+                            }
+                        }
+                        if (n_entries < 64) {
+                            entries[n_entries].base = cur_ptr;
+                            entries[n_entries].len  = exp_size;
+                            n_entries++;
+                        }
+                    }
+                    for (int i = 0; i < n_entries; ++i) {
+                        uintptr_t addr = (uintptr_t) entries[i].base;
+                        uintptr_t aligned = addr & ~(uintptr_t)4095;
+                        size_t len = entries[i].len + (size_t)(addr - aligned);
+                        madvise((void *)aligned, len, MADV_WILLNEED);
                     }
                 }
 #endif
@@ -2343,8 +2614,8 @@ static void ggml_compute_forward_mul_mat_id(
                         const int32_t next_eid = *(const int32_t *) ((const char *) ids->data + next_id * ids->nb[0]);
                         if (next_eid >= 0 && next_eid < n_as) {
                             const char * next_src = (const char *) src0->data + (size_t) next_eid * nb02;
-                            _mm_prefetch(next_src, _MM_HINT_NTA);
-                            _mm_prefetch(next_src + 64, _MM_HINT_NTA);
+                            _mm_prefetch(next_src, _MM_HINT_T0);
+                            _mm_prefetch(next_src + 64, _MM_HINT_T0);
                         }
                     }
 #endif
@@ -2357,15 +2628,20 @@ static void ggml_compute_forward_mul_mat_id(
                     if (type == GGML_TYPE_Q5_K) {
                         int64_t row = first_row;
 #if defined(__x86_64__) || defined(_M_X64)
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_NTA);
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_NTA);
+                        const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
+                        const char * init_ptr = src0_cur + (size_t) first_row * nb01;
+                        for (size_t po = 0; po < init_len; po += 64) {
+                            _mm_prefetch(init_ptr + po, _MM_HINT_T0);
+                        }
 #endif
                         for (; row + 7 < last_row; row += 8) {
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 15 < last_row) {
                                 const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
-                                _mm_prefetch(p_ahead, _MM_HINT_NTA);
-                                _mm_prefetch(p_ahead + 64, _MM_HINT_NTA);
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 8) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p_ahead + po, _MM_HINT_T1);
+                                }
                             }
 #endif
                             ggml_vec_dot_q5_K_q8_K(ne00, &dst_col[row + 0], 0, src0_cur + (size_t) (row + 0) * nb01, 0, src1_col, 0, 1);
@@ -2381,7 +2657,10 @@ static void ggml_compute_forward_mul_mat_id(
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 7 < last_row) {
                                 const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
-                                _mm_prefetch(p4, _MM_HINT_NTA);
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 4) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p4 + po, _MM_HINT_T1);
+                                }
                             }
 #endif
                             ggml_vec_dot_q5_K_q8_K(ne00, &dst_col[row + 0], 0, src0_cur + (size_t) (row + 0) * nb01, 0, src1_col, 0, 1);
@@ -2395,15 +2674,15 @@ static void ggml_compute_forward_mul_mat_id(
                     } else if (type == GGML_TYPE_Q5_1) {
                         int64_t row = first_row;
 #if defined(__x86_64__) || defined(_M_X64)
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_NTA);
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_NTA);
+                        _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_T0);
+                        _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_T0);
 #endif
                         for (; row + 7 < last_row; row += 8) {
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 15 < last_row) {
                                 const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
-                                _mm_prefetch(p_ahead, _MM_HINT_NTA);
-                                _mm_prefetch(p_ahead + 64, _MM_HINT_NTA);
+                                _mm_prefetch(p_ahead, _MM_HINT_T0);
+                                _mm_prefetch(p_ahead + 64, _MM_HINT_T0);
                             }
 #endif
                             ggml_vec_dot_q5_1_q8_1(ne00, &dst_col[row + 0], 0, src0_cur + (size_t) (row + 0) * nb01, 0, src1_col, 0, 1);
@@ -2419,7 +2698,7 @@ static void ggml_compute_forward_mul_mat_id(
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 7 < last_row) {
                                 const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
-                                _mm_prefetch(p4, _MM_HINT_NTA);
+                                _mm_prefetch(p4, _MM_HINT_T0);
                             }
 #endif
                             ggml_vec_dot_q5_1_q8_1(ne00, &dst_col[row + 0], 0, src0_cur + (size_t) (row + 0) * nb01, 0, src1_col, 0, 1);
@@ -2433,15 +2712,15 @@ static void ggml_compute_forward_mul_mat_id(
                     } else if (type == GGML_TYPE_Q8_0) {
                         int64_t row = first_row;
 #if defined(__x86_64__) || defined(_M_X64)
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_NTA);
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_NTA);
+                        _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_T0);
+                        _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_T0);
 #endif
                         for (; row + 7 < last_row; row += 8) {
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 15 < last_row) {
                                 const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
-                                _mm_prefetch(p_ahead, _MM_HINT_NTA);
-                                _mm_prefetch(p_ahead + 64, _MM_HINT_NTA);
+                                _mm_prefetch(p_ahead, _MM_HINT_T0);
+                                _mm_prefetch(p_ahead + 64, _MM_HINT_T0);
                             }
 #endif
                             ggml_vec_dot_q8_0_q8_0(ne00, &dst_col[row + 0], 0, src0_cur + (size_t) (row + 0) * nb01, 0, src1_col, 0, 1);
@@ -2457,7 +2736,7 @@ static void ggml_compute_forward_mul_mat_id(
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 7 < last_row) {
                                 const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
-                                _mm_prefetch(p4, _MM_HINT_NTA);
+                                _mm_prefetch(p4, _MM_HINT_T0);
                             }
 #endif
                             ggml_vec_dot_q8_0_q8_0(ne00, &dst_col[row + 0], 0, src0_cur + (size_t) (row + 0) * nb01, 0, src1_col, 0, 1);
@@ -2471,15 +2750,15 @@ static void ggml_compute_forward_mul_mat_id(
                     } else if (type == GGML_TYPE_IQ3_XXS) {
                         int64_t row = first_row;
 #if defined(__x86_64__) || defined(_M_X64)
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_NTA);
-                        _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_NTA);
+                        _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_T0);
+                        _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_T0);
 #endif
                         for (; row + 7 < last_row; row += 8) {
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 15 < last_row) {
                                 const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
-                                _mm_prefetch(p_ahead, _MM_HINT_NTA);
-                                _mm_prefetch(p_ahead + 64, _MM_HINT_NTA);
+                                _mm_prefetch(p_ahead, _MM_HINT_T0);
+                                _mm_prefetch(p_ahead + 64, _MM_HINT_T0);
                             }
 #endif
                             ggml_vec_dot_iq3_xxs_q8_K_x4(ne00, &dst_col[row + 0], sizeof(float), src0_cur + (size_t) (row + 0) * nb01, nb01, src1_col, 0, 4);
@@ -2489,7 +2768,7 @@ static void ggml_compute_forward_mul_mat_id(
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 7 < last_row) {
                                 const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
-                                _mm_prefetch(p4, _MM_HINT_NTA);
+                                _mm_prefetch(p4, _MM_HINT_T0);
                             }
 #endif
                             ggml_vec_dot_iq3_xxs_q8_K_x4(ne00, &dst_col[row], sizeof(float), src0_cur + (size_t) row * nb01, nb01, src1_col, 0, 4);
@@ -2497,11 +2776,75 @@ static void ggml_compute_forward_mul_mat_id(
                         for (; row < last_row; ++row) {
                             ggml_vec_dot_iq3_xxs_q8_K(ne00, &dst_col[row], 0, src0_cur + (size_t) row * nb01, 0, src1_col, 0, 1);
                         }
+                    } else if (type == GGML_TYPE_MXFP4) {
+                        int64_t row = first_row;
+#if defined(__x86_64__) || defined(_M_X64)
+                        const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
+                        const char * init_ptr = src0_cur + (size_t) first_row * nb01;
+                        for (size_t po = 0; po < init_len; po += 64) {
+                            _mm_prefetch(init_ptr + po, _MM_HINT_T0);
+                        }
+#endif
+                        for (; row + 7 < last_row; row += 8) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            if (row + 15 < last_row) {
+                                const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 8) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p_ahead + po, _MM_HINT_T1);
+                                }
+                            }
+#endif
+                            ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_col[row + 0], sizeof(float), src0_cur + (size_t) (row + 0) * nb01, nb01, src1_col, 0, 4);
+                            ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_col[row + 4], sizeof(float), src0_cur + (size_t) (row + 4) * nb01, nb01, src1_col, 0, 4);
+                        }
+                        for (; row + 3 < last_row; row += 4) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            if (row + 7 < last_row) {
+                                const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 4) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p4 + po, _MM_HINT_T1);
+                                }
+                            }
+#endif
+                            ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_col[row], sizeof(float), src0_cur + (size_t) row * nb01, nb01, src1_col, 0, 4);
+                        }
+                        for (; row < last_row; ++row) {
+                            ggml_vec_dot_mxfp4_q8_0(ne00, &dst_col[row], 0, src0_cur + (size_t) row * nb01, 0, src1_col, 0, 1);
+                        }
+                    } else if (type == GGML_TYPE_IQ4_XS) {
+                        int64_t row = first_row;
+#if defined(__x86_64__) || defined(_M_X64)
+                        const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
+                        const char * init_ptr = src0_cur + (size_t) first_row * nb01;
+                        for (size_t po = 0; po < init_len; po += 64) {
+                            _mm_prefetch(init_ptr + po, _MM_HINT_T1);
+                        }
+#endif
+                        for (; row + 3 < last_row; row += 4) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            if (row + 7 < last_row) {
+                                const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 4) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p4 + po, _MM_HINT_T1);
+                                }
+                            }
+#endif
+                            ggml_vec_dot_iq4_xs_q8_K(ne00, &dst_col[row + 0], 0, src0_cur + (size_t) (row + 0) * nb01, 0, src1_col, 0, 1);
+                            ggml_vec_dot_iq4_xs_q8_K(ne00, &dst_col[row + 1], 0, src0_cur + (size_t) (row + 1) * nb01, 0, src1_col, 0, 1);
+                            ggml_vec_dot_iq4_xs_q8_K(ne00, &dst_col[row + 2], 0, src0_cur + (size_t) (row + 2) * nb01, 0, src1_col, 0, 1);
+                            ggml_vec_dot_iq4_xs_q8_K(ne00, &dst_col[row + 3], 0, src0_cur + (size_t) (row + 3) * nb01, 0, src1_col, 0, 1);
+                        }
+                        for (; row < last_row; ++row) {
+                            ggml_vec_dot_iq4_xs_q8_K(ne00, &dst_col[row], 0, src0_cur + (size_t) row * nb01, 0, src1_col, 0, 1);
+                        }
                     } else if (type == GGML_TYPE_F32) {
                         for (int64_t row = first_row; row < last_row; ++row) {
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 1 < last_row) {
-                                _mm_prefetch(src0_cur + (size_t) (row + 1) * nb01, _MM_HINT_NTA);
+                                _mm_prefetch(src0_cur + (size_t) (row + 1) * nb01, _MM_HINT_T0);
                             }
 #endif
                             ggml_vec_dot_f32(ne00, &dst_col[row], 0, (const float *)(src0_cur + (size_t) row * nb01), 0, (const float *)src1_col, 0, 1);
@@ -2510,7 +2853,7 @@ static void ggml_compute_forward_mul_mat_id(
                         for (int64_t row = first_row; row < last_row; ++row) {
 #if defined(__x86_64__) || defined(_M_X64)
                             if (row + 1 < last_row) {
-                                _mm_prefetch(src0_cur + (size_t) (row + 1) * nb01, _MM_HINT_NTA);
+                                _mm_prefetch(src0_cur + (size_t) (row + 1) * nb01, _MM_HINT_T0);
                             }
 #endif
                             vec_dot(ne00, &dst_col[row], 0, src0_cur + (size_t) row * nb01, 0, src1_col, 0, 1);
@@ -2588,6 +2931,14 @@ static void ggml_compute_forward_mul_mat_id(
                     for (; row < last_row; ++row) {
                         ggml_vec_dot_q8_0_q8_0(ne00, &dst_col[row], 0, src0_cur + row * nb01, 0, src1_col, 0, 1);
                     }
+                } else if (type == GGML_TYPE_MXFP4) {
+                    int64_t row = first_row;
+                    for (; row + 3 < last_row; row += 4) {
+                        ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_col[row], sizeof(float), src0_cur + (size_t) row * nb01, nb01, src1_col, 0, 4);
+                    }
+                    for (; row < last_row; ++row) {
+                        ggml_vec_dot_mxfp4_q8_0(ne00, &dst_col[row], 0, src0_cur + (size_t) row * nb01, 0, src1_col, 0, 1);
+                    }
                 } else if (type == GGML_TYPE_F32) {
                     for (int64_t row = first_row; row < last_row; ++row) {
                         ggml_vec_dot_f32(ne00, &dst_col[row], 0, (const float *)(src0_cur + row * nb01), 0, (const float *)src1_col, 0, 1);
@@ -2624,10 +2975,10 @@ static void ggml_compute_forward_mul_mat_id(
         static int s_union_cap = -1;
         if (s_union_cap < 0) {
             const char * env_cap = getenv("ATLAS_MTP_UNION_CAP");
-            if (env_cap) {
+            if (env_cap && atoi(env_cap) > 0) {
                 s_union_cap = atoi(env_cap);
             } else {
-                s_union_cap = 6;
+                s_union_cap = 0; // Adaptive default (keep_k + 2)
             }
         }
 
@@ -2635,7 +2986,7 @@ static void ggml_compute_forward_mul_mat_id(
         int n_unique = 0;
 
         const int keep_k = ggml_cpu_get_keep_k_spec(src0, (int) n_ids);
-        const int cap = (s_union_cap > 0 && s_union_cap < (keep_k + 1)) ? s_union_cap : ((keep_k <= 1) ? 2 : (keep_k + 1));
+        const int cap = (s_union_cap > 0) ? s_union_cap : (keep_k + 2);
 
         // Token 0 (Primary continuation token) gets its top keep_k experts
         for (int id = 0; id < (int) n_ids; ++id) {
@@ -2676,11 +3027,11 @@ static void ggml_compute_forward_mul_mat_id(
                 }
                 if (in_unique) {
                     active_slots[n_active++] = (struct mmid_fast_slot) { expert_id, id, (int32_t) iid1 };
-                } else if (n_unique < cap && id == 0) {
+                } else if (n_unique < cap && n_unique < 64) {
                     unique_experts[n_unique++] = expert_id;
                     active_slots[n_active++] = (struct mmid_fast_slot) { expert_id, id, (int32_t) iid1 };
-                } else if (keep_k == (int) n_ids) {
-                    // Test harness path (keep all valid experts when no dynamic-k active)
+                } else if (getenv("ATLAS_SPEC_FORCE_ALL") != NULL) {
+                    // Test harness path (keep all valid experts when explicitly forced)
                     active_slots[n_active++] = (struct mmid_fast_slot) { expert_id, id, (int32_t) iid1 };
                 } else {
                     skipped_slots[n_skipped++] = (struct mmid_fast_slot) { expert_id, id, (int32_t) iid1 };
@@ -2743,6 +3094,32 @@ static void ggml_compute_forward_mul_mat_id(
                 s_pfnPrefetch(GetCurrentProcess(), (ULONG_PTR) n_pf, entries, 0);
             }
         }
+#elif defined(__linux__)
+        if (ith == 0 && n_groups > 0 && !g_atlas_is_decode) {
+            struct { char * base; size_t len; } entries[64];
+            const size_t exp_size = (size_t) nb02;
+            const int n_pf = MIN(n_groups, 64);
+            int n_entries = 0;
+            for (int s = 0; s < n_pf; ++s) {
+                char * cur_ptr = (char *) src0->data + (size_t) groups[s].expert_id * nb02;
+                if (n_entries > 0) {
+                    char * prev_end = entries[n_entries - 1].base + entries[n_entries - 1].len;
+                    if (cur_ptr == prev_end || (cur_ptr > prev_end && (size_t)(cur_ptr - prev_end) <= 65536)) {
+                        entries[n_entries - 1].len = (size_t)((cur_ptr + exp_size) - entries[n_entries - 1].base);
+                        continue;
+                    }
+                }
+                entries[n_entries].base = cur_ptr;
+                entries[n_entries].len  = exp_size;
+                n_entries++;
+            }
+            for (int i = 0; i < n_entries; ++i) {
+                uintptr_t addr = (uintptr_t) entries[i].base;
+                uintptr_t aligned = addr & ~(uintptr_t)4095;
+                size_t len = entries[i].len + (size_t)(addr - aligned);
+                madvise((void *)aligned, len, MADV_WILLNEED);
+            }
+        }
 #endif
 
         // Zero skipped slots cooperatively before barrier
@@ -2782,7 +3159,7 @@ static void ggml_compute_forward_mul_mat_id(
                         ((src1_cont || src1->type != vec_dot_type) ? (size_t) (i11 + iid1 * ne11) * row_size : (size_t) (i11 * nb11 + iid1 * nb12));
 #if defined(__x86_64__) || defined(_M_X64)
                     for (size_t po = 0; po < row_size; po += 64) {
-                        _mm_prefetch((const char *)src1_cols[s] + po, _MM_HINT_NTA);
+                        _mm_prefetch((const char *)src1_cols[s] + po, _MM_HINT_T0);
                     }
 #endif
                 }
@@ -2795,7 +3172,7 @@ static void ggml_compute_forward_mul_mat_id(
                     const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
                     const char * init_ptr = src0_cur + (size_t) first_row * nb01;
                     for (size_t po = 0; po < init_len; po += 64) {
-                        _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                        _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                     }
 #endif
                     for (; row + 7 < last_row; row += 8) {
@@ -2844,7 +3221,7 @@ static void ggml_compute_forward_mul_mat_id(
                     const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
                     const char * init_ptr = src0_cur + (size_t) first_row * nb01;
                     for (size_t po = 0; po < init_len; po += 64) {
-                        _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                        _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                     }
 #endif
                     for (; row + 7 < last_row; row += 8) {
@@ -2890,15 +3267,15 @@ static void ggml_compute_forward_mul_mat_id(
                 } else if (type == GGML_TYPE_Q8_0) {
                     int64_t row = first_row;
 #if defined(__x86_64__) || defined(_M_X64)
-                    _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_NTA);
-                    _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_NTA);
+                    _mm_prefetch(src0_cur + (size_t) first_row * nb01, _MM_HINT_T0);
+                    _mm_prefetch(src0_cur + (size_t) first_row * nb01 + 64, _MM_HINT_T0);
 #endif
                     for (; row + 7 < last_row; row += 8) {
 #if defined(__x86_64__) || defined(_M_X64)
                         if (row + 15 < last_row) {
                             const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
-                            _mm_prefetch(p_ahead, _MM_HINT_NTA);
-                            _mm_prefetch(p_ahead + 64, _MM_HINT_NTA);
+                            _mm_prefetch(p_ahead, _MM_HINT_T0);
+                            _mm_prefetch(p_ahead + 64, _MM_HINT_T0);
                         }
 #endif
                         for (int k = 0; k < 8; ++k) {
@@ -2912,7 +3289,7 @@ static void ggml_compute_forward_mul_mat_id(
 #if defined(__x86_64__) || defined(_M_X64)
                         if (row + 7 < last_row) {
                             const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
-                            _mm_prefetch(p4, _MM_HINT_NTA);
+                            _mm_prefetch(p4, _MM_HINT_T0);
                         }
 #endif
                         for (int k = 0; k < 4; ++k) {
@@ -2934,7 +3311,7 @@ static void ggml_compute_forward_mul_mat_id(
                     const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
                     const char * init_ptr = src0_cur + (size_t) first_row * nb01;
                     for (size_t po = 0; po < init_len; po += 64) {
-                        _mm_prefetch(init_ptr + po, _MM_HINT_NTA);
+                        _mm_prefetch(init_ptr + po, _MM_HINT_T0);
                     }
 #endif
                     for (; row + 7 < last_row; row += 8) {
@@ -2965,7 +3342,7 @@ static void ggml_compute_forward_mul_mat_id(
 #if defined(__x86_64__) || defined(_M_X64)
                         if (row + 7 < last_row) {
                             const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
-                            _mm_prefetch(p4, _MM_HINT_NTA);
+                            _mm_prefetch(p4, _MM_HINT_T0);
                         }
 #endif
                         for (int k = 0; k < 4; ++k) {
@@ -2993,6 +3370,139 @@ static void ggml_compute_forward_mul_mat_id(
                         }
                         for (; s < n_slots; ++s) {
                             ggml_vec_dot_iq3_xxs_q8_K_vnni(ne00, &dst_cols[s][row], 0, w_row, 0, src1_cols[s], 0, 1);
+                        }
+                    }
+                } else if (type == GGML_TYPE_MXFP4) {
+                    int64_t row = first_row;
+#if defined(__x86_64__) || defined(_M_X64)
+                    const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
+                    const char * init_ptr = src0_cur + (size_t) first_row * nb01;
+                    for (size_t po = 0; po < init_len; po += 64) {
+                        _mm_prefetch(init_ptr + po, _MM_HINT_T0);
+                    }
+#endif
+                    if (n_slots == 1) {
+                        for (; row + 7 < last_row; row += 8) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            if (row + 15 < last_row) {
+                                const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 8) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p_ahead + po, _MM_HINT_T1);
+                                }
+                            }
+#endif
+                            ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_cols[0][row + 0], sizeof(float), src0_cur + (size_t) (row + 0) * nb01, nb01, src1_cols[0], 0, 4);
+                            ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_cols[0][row + 4], sizeof(float), src0_cur + (size_t) (row + 4) * nb01, nb01, src1_cols[0], 0, 4);
+                        }
+                        for (; row + 3 < last_row; row += 4) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            if (row + 7 < last_row) {
+                                const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 4) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p4 + po, _MM_HINT_T1);
+                                }
+                            }
+#endif
+                            ggml_vec_dot_mxfp4_q8_0_x4(ne00, &dst_cols[0][row], sizeof(float), src0_cur + (size_t) row * nb01, nb01, src1_cols[0], 0, 4);
+                        }
+                        for (; row < last_row; ++row) {
+                            ggml_vec_dot_mxfp4_q8_0(ne00, &dst_cols[0][row], 0, src0_cur + (size_t) row * nb01, 0, src1_cols[0], 0, 1);
+                        }
+                    } else {
+                        for (; row + 7 < last_row; row += 8) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            if (row + 15 < last_row) {
+                                const char * p_ahead = src0_cur + (size_t) (row + 8) * nb01;
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 8) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p_ahead + po, _MM_HINT_T1);
+                                }
+                            }
+#endif
+                            for (int k = 0; k < 8; ++k) {
+                                const char * w_row = src0_cur + (size_t) (row + k) * nb01;
+                                int s = 0;
+                                for (; s + 1 < n_slots; s += 2) {
+                                    float s2[2];
+                                    ggml_vec_dot_mxfp4_q8_0_nrc2(ne00, s2, sizeof(float), w_row, 0, src1_cols[s], (const char *)src1_cols[s+1] - (const char *)src1_cols[s], 2);
+                                    dst_cols[s + 0][row + k] = s2[0];
+                                    dst_cols[s + 1][row + k] = s2[1];
+                                }
+                                for (; s < n_slots; ++s) {
+                                    ggml_vec_dot_mxfp4_q8_0(ne00, &dst_cols[s][row + k], 0, w_row, 0, src1_cols[s], 0, 1);
+                                }
+                            }
+                        }
+                        for (; row + 3 < last_row; row += 4) {
+#if defined(__x86_64__) || defined(_M_X64)
+                            if (row + 7 < last_row) {
+                                const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
+                                const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 4) * nb01);
+                                for (size_t po = 0; po < pf_len; po += 64) {
+                                    _mm_prefetch(p4 + po, _MM_HINT_T1);
+                                }
+                            }
+#endif
+                            for (int k = 0; k < 4; ++k) {
+                                const char * w_row = src0_cur + (size_t) (row + k) * nb01;
+                                int s = 0;
+                                for (; s + 1 < n_slots; s += 2) {
+                                    float s2[2];
+                                    ggml_vec_dot_mxfp4_q8_0_nrc2(ne00, s2, sizeof(float), w_row, 0, src1_cols[s], (const char *)src1_cols[s+1] - (const char *)src1_cols[s], 2);
+                                    dst_cols[s + 0][row + k] = s2[0];
+                                    dst_cols[s + 1][row + k] = s2[1];
+                                }
+                                for (; s < n_slots; ++s) {
+                                    ggml_vec_dot_mxfp4_q8_0(ne00, &dst_cols[s][row + k], 0, w_row, 0, src1_cols[s], 0, 1);
+                                }
+                            }
+                        }
+                        for (; row < last_row; ++row) {
+                            const char * w_row = src0_cur + (size_t) row * nb01;
+                            int s = 0;
+                            for (; s + 1 < n_slots; s += 2) {
+                                float s2[2];
+                                ggml_vec_dot_mxfp4_q8_0_nrc2(ne00, s2, sizeof(float), w_row, 0, src1_cols[s], (const char *)src1_cols[s+1] - (const char *)src1_cols[s], 2);
+                                dst_cols[s + 0][row] = s2[0];
+                                dst_cols[s + 1][row] = s2[1];
+                            }
+                            for (; s < n_slots; ++s) {
+                                ggml_vec_dot_mxfp4_q8_0(ne00, &dst_cols[s][row], 0, w_row, 0, src1_cols[s], 0, 1);
+                            }
+                        }
+                    }
+                } else if (type == GGML_TYPE_IQ4_XS) {
+                    int64_t row = first_row;
+#if defined(__x86_64__) || defined(_M_X64)
+                    const size_t init_len = MIN((size_t) (4 * nb01), (size_t) (last_row - first_row) * nb01);
+                    const char * init_ptr = src0_cur + (size_t) first_row * nb01;
+                    for (size_t po = 0; po < init_len; po += 64) {
+                        _mm_prefetch(init_ptr + po, _MM_HINT_T1);
+                    }
+#endif
+                    for (; row + 3 < last_row; row += 4) {
+#if defined(__x86_64__) || defined(_M_X64)
+                        if (row + 7 < last_row) {
+                            const char * p4 = src0_cur + (size_t) (row + 4) * nb01;
+                            const size_t pf_len = MIN((size_t) (2 * nb01), (size_t) (last_row - row - 4) * nb01);
+                            for (size_t po = 0; po < pf_len; po += 64) {
+                                _mm_prefetch(p4 + po, _MM_HINT_T1);
+                            }
+                        }
+#endif
+                        for (int k = 0; k < 4; ++k) {
+                            const char * w_row = src0_cur + (size_t) (row + k) * nb01;
+                            for (int s = 0; s < n_slots; ++s) {
+                                ggml_vec_dot_iq4_xs_q8_K(ne00, &dst_cols[s][row + k], 0, w_row, 0, src1_cols[s], 0, 1);
+                            }
+                        }
+                    }
+                    for (; row < last_row; ++row) {
+                        const char * w_row = src0_cur + (size_t) row * nb01;
+                        for (int s = 0; s < n_slots; ++s) {
+                            ggml_vec_dot_iq4_xs_q8_K(ne00, &dst_cols[s][row], 0, w_row, 0, src1_cols[s], 0, 1);
                         }
                     }
                 } else if (type == GGML_TYPE_F32) {
@@ -3036,26 +3546,113 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     const int keep_k = ggml_cpu_get_keep_k_prefill(src0, (int) n_ids);
+    const bool is_real_122b = (ne00 == 3072 || ne01 == 3072);
+    const bool is_122b_pf = (is_real_122b && (ids->ne[1] > 12) && (n_as <= 256)) ||
+                            ((n_as == 512) && (ids->ne[1] >= 120 && ids->ne[1] <= 160));
 
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
         int32_t n_act = 0;
 
-        // group rows by src0 matrix (pruned experts beyond keep_k skipped)
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < keep_k; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+        if (is_122b_pf) {
+            const int layer = atlas_parse_moe_layer(src0->name);
+            const int max_pf_experts = is_real_122b
+                ? ((layer < 2 || layer >= 46) ? 20 : ((layer >= 18 && layer <= 29) ? 16 : 12))
+                : ((layer < 2 || layer >= 44) ? 24 : ((layer >= 15 && layer <= 30) ? 20 : 16));
+            const int64_t tail_pin = is_real_122b ? 12 : ((n_as >= 512) ? 32 : 16);
+            uint8_t sel_exp[512];
+            int16_t exp_freq[512];
+            memset(sel_exp, 0, sizeof(sel_exp));
+            memset(exp_freq, 0, sizeof(exp_freq));
+            int n_sel = 0;
 
-                if (i02 < 0 || i02 >= n_as) {
-                    continue;
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                const bool is_pinned_tok = (iid1 < 4) || (iid1 >= ids->ne[1] - tail_pin);
+                for (int id = 0; id < keep_k; ++id) {
+                    const int32_t e = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                    if (e >= 0 && e < n_as) {
+                        exp_freq[e] += (id == 0) ? 3 : 1;
+                        if (is_pinned_tok && !sel_exp[e]) {
+                            sel_exp[e] = 1;
+                            n_sel++;
+                        }
+                    }
                 }
+            }
 
-                if (matrix_row_counts[i02] == 0) {
-                    active_experts[n_act++] = i02;
+            while (n_sel < max_pf_experts) {
+                int best_e = -1;
+                int16_t best_f = 0;
+                for (int e = 0; e < n_as; ++e) {
+                    if (!sel_exp[e] && exp_freq[e] > best_f) {
+                        best_f = exp_freq[e];
+                        best_e = e;
+                    }
                 }
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, (int32_t) iid1};
-                matrix_row_counts[i02] += 1;
+                if (best_e < 0) {
+                    break;
+                }
+                sel_exp[best_e] = 1;
+                n_sel++;
+            }
+
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                const bool is_pinned_tok = (iid1 < 4) || (iid1 >= ids->ne[1] - tail_pin);
+                if (is_pinned_tok) {
+                    for (int id = 0; id < keep_k; ++id) {
+                        const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        if (i02 < 0 || i02 >= n_as) continue;
+                        if (matrix_row_counts[i02] == 0) {
+                            active_experts[n_act++] = i02;
+                        }
+                        MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, (int32_t) iid1};
+                        matrix_row_counts[i02] += 1;
+                    }
+                } else {
+                    int chosen_id = -1;
+                    int32_t chosen_e = -1;
+                    for (int id = 0; id < (int)n_ids; ++id) {
+                        const int32_t e = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        if (e >= 0 && e < n_as && sel_exp[e]) {
+                            chosen_id = id;
+                            chosen_e = e;
+                            break;
+                        }
+                    }
+                    if (chosen_id < 0) {
+                        const int32_t e0 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1]);
+                        if (e0 >= 0 && e0 < n_as) {
+                            sel_exp[e0] = 1;
+                            chosen_id = 0;
+                            chosen_e = e0;
+                        }
+                    }
+                    if (chosen_id >= 0 && chosen_e >= 0 && chosen_e < n_as) {
+                        if (matrix_row_counts[chosen_e] == 0) {
+                            active_experts[n_act++] = chosen_e;
+                        }
+                        MMID_MATRIX_ROW(chosen_e, matrix_row_counts[chosen_e]) = (struct mmid_row_mapping) {chosen_id, (int32_t) iid1};
+                        matrix_row_counts[chosen_e] += 1;
+                    }
+                }
+            }
+        } else {
+            // group rows by src0 matrix (pruned experts beyond keep_k skipped)
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int id = 0; id < keep_k; ++id) {
+                    const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                    if (i02 < 0 || i02 >= n_as) {
+                        continue;
+                    }
+
+                    if (matrix_row_counts[i02] == 0) {
+                        active_experts[n_act++] = i02;
+                    }
+                    MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, (int32_t) iid1};
+                    matrix_row_counts[i02] += 1;
+                }
             }
         }
         *n_active_ptr = n_act;
@@ -3087,12 +3684,27 @@ static void ggml_compute_forward_mul_mat_id(
                 GGML_WIN32_MEMORY_RANGE_ENTRY entries[512];
                 const size_t exp_size = (size_t) nb02;
                 const int32_t to_prefetch = (n_act < 512) ? n_act : 512;
+                int n_entries = 0;
                 for (int32_t a = 0; a < to_prefetch; ++a) {
                     const int cur_a = active_experts[a];
-                    entries[a].VirtualAddress = (PVOID)((char *) src0->data + cur_a * nb02);
-                    entries[a].NumberOfBytes  = exp_size;
+                    char * cur_ptr = (char *) src0->data + (size_t) cur_a * nb02;
+                    if (n_entries > 0) {
+                        char * prev_end = (char *) entries[n_entries - 1].VirtualAddress + entries[n_entries - 1].NumberOfBytes;
+                        // Coalesce adjacent or near-contiguous experts (<= 64KB page gap) into single large sequential DMA block
+                        if (cur_ptr == prev_end || (cur_ptr > prev_end && (size_t)(cur_ptr - prev_end) <= 65536)) {
+                            entries[n_entries - 1].NumberOfBytes = (size_t)((cur_ptr + exp_size) - (char *) entries[n_entries - 1].VirtualAddress);
+                            continue;
+                        }
+                    }
+                    if (n_entries < 512) {
+                        entries[n_entries].VirtualAddress = (PVOID) cur_ptr;
+                        entries[n_entries].NumberOfBytes  = exp_size;
+                        n_entries++;
+                    }
                 }
-                s_pfnPrefetch(GetCurrentProcess(), (ULONG_PTR) to_prefetch, entries, 0);
+                if (n_entries > 0) {
+                    s_pfnPrefetch(GetCurrentProcess(), (ULONG_PTR) n_entries, entries, 0);
+                }
             }
         }
 #endif
@@ -3108,7 +3720,7 @@ static void ggml_compute_forward_mul_mat_id(
         for (int64_t s = slot_begin; s < slot_end; ++s) {
             const int64_t iid1 = s / n_ids;
             const int id = (int) (s % n_ids);
-            if (id >= keep_k) {
+            if (is_122b_pf || id >= keep_k) {
                 float * dst_col = (float *) ((char *) dst->data + (size_t) id * nb1 + (size_t) iid1 * nb2);
                 memset(dst_col, 0, (size_t) nr0_multi * sizeof(float));
             } else {
@@ -3132,11 +3744,53 @@ static void ggml_compute_forward_mul_mat_id(
         const int32_t a_start = (int32_t) ith * n_act / nth;
         const int32_t a_end   = (int32_t) (ith + 1) * n_act / nth;
 
+#if defined(__linux__)
+        if (a_end > a_start) {
+            struct { char * base; size_t len; } entries[16];
+            const size_t exp_size = (size_t) nb02;
+            const int32_t max_th_pf = (n_as <= 256) ? 4 : 8;
+            const int32_t pf_end = (a_end - a_start > max_th_pf) ? (a_start + max_th_pf) : a_end;
+            int n_entries = 0;
+            for (int32_t a = a_start; a < pf_end; ++a) {
+                const int cur_a = active_experts[a];
+                char * cur_ptr = (char *) src0->data + (size_t) cur_a * nb02;
+                if (n_entries > 0) {
+                    char * prev_end = entries[n_entries - 1].base + entries[n_entries - 1].len;
+                    if (cur_ptr == prev_end || (cur_ptr > prev_end && (size_t)(cur_ptr - prev_end) <= 65536)) {
+                        entries[n_entries - 1].len = (size_t)((cur_ptr + exp_size) - entries[n_entries - 1].base);
+                        continue;
+                    }
+                }
+                if (n_entries < 16) {
+                    entries[n_entries].base = cur_ptr;
+                    entries[n_entries].len  = exp_size;
+                    n_entries++;
+                }
+            }
+            for (int i = 0; i < n_entries; ++i) {
+                uintptr_t addr = (uintptr_t) entries[i].base;
+                uintptr_t aligned = addr & ~(uintptr_t)4095;
+                size_t len = entries[i].len + (size_t)(addr - aligned);
+                madvise((void *)aligned, len, MADV_WILLNEED);
+            }
+        }
+#endif
+
         for (int32_t a_idx = a_start; a_idx < a_end; ++a_idx) {
             const int cur_a = active_experts[a_idx];
             const int64_t cne1 = matrix_row_counts[cur_a];
 
             if (cne1 == 0) continue;
+
+            // Pipeline software prefetch for the next expert assigned to this thread
+            if (a_idx + 1 < a_end) {
+                const int next_a = active_experts[a_idx + 1];
+                const char * next_src0 = (const char *) src0->data + (size_t) next_a * nb02;
+                _mm_prefetch(next_src0, _MM_HINT_T0);
+                _mm_prefetch(next_src0 + 64, _MM_HINT_T0);
+                _mm_prefetch(next_src0 + 128, _MM_HINT_T0);
+                _mm_prefetch(next_src0 + 192, _MM_HINT_T0);
+            }
 
             if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
                 struct ggml_compute_params params_single = *params;
@@ -3165,6 +3819,13 @@ static void ggml_compute_forward_mul_mat_id(
 
             if (cne1 == 0) {
                 continue;
+            }
+
+            if (a_idx + 1 < n_act) {
+                const int next_a = active_experts[a_idx + 1];
+                const char * next_src0 = (const char *) src0->data + (size_t) next_a * nb02;
+                _mm_prefetch(next_src0, _MM_HINT_T0);
+                _mm_prefetch(next_src0 + 64, _MM_HINT_T0);
             }
 
             if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
@@ -5481,6 +6142,8 @@ void ggml_cpu_init(void) {
 
 void (*g_atlas_record_cpu_moe_us)(int layer, int64_t start_us, int64_t duration_us, uint64_t logical_bytes) = NULL;
 void (*g_atlas_record_moe_experts)(int layer, int n_ids, const int32_t * ids, int is_decode) = NULL;
+void (*g_atlas_signal_lookahead_preduction)(int layer, const void * cur_hidden) = NULL;
+
 #ifdef _WIN32
 __declspec(dllexport)
 #else
@@ -5497,6 +6160,15 @@ __attribute__((visibility("default")))
 #endif
 void atlas_set_moe_experts_callback(void (*cb)(int, int, const int32_t *, int)) {
     g_atlas_record_moe_experts = cb;
+}
+
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void atlas_set_lookahead_preduction_callback(void (*cb)(int, const void *)) {
+    g_atlas_signal_lookahead_preduction = cb;
 }
 
 #ifdef _WIN32

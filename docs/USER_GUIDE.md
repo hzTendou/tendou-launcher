@@ -1,8 +1,9 @@
 # Tendou Launcher — Kapsamlı Kullanıcı ve Entegrasyon Kılavuzu
 
 **Sürüm:** v0.9.0-stable  
-**Hedef Platform:** Windows 11 (x86-64 / NVIDIA CUDA)  
-**Doküman Kodu:** `DOC-USER-GUIDE-09`
+**Hedef Platform:** Windows 11 (x86-64 / NVIDIA CUDA) & Kubuntu 26.04 Linux  
+**Doküman Kodu:** `DOC-USER-GUIDE-09`  
+*(Kubuntu 26.04 üzerinde sunucu başlatma, systemd/tmux yönetimi, Claude Code, OpenCode ve Cline doğrudan kurulumu için özel olarak hazırlanmış [KUBUNTU_USER_GUIDE.md](KUBUNTU_USER_GUIDE.md) kılavuzuna bakın).*
 
 ---
 

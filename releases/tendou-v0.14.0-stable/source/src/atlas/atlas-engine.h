@@ -21,6 +21,11 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <cstdlib>
+#include <cstring>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -30,6 +35,14 @@
 #endif
 #include <windows.h>
 #include <winioctl.h>
+#else
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
+using HANDLE = void *;
+#ifndef INVALID_HANDLE_VALUE
+#define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
+#endif
 #endif
 
 namespace atlas {
@@ -213,7 +226,7 @@ struct Config {
     bool fast_cb          = true;  // Fast callback mode: skip synchronous topk readback (avoids 48 GPU syncs/tok)
     bool async_trace      = true;
     int  prefetch_lead    = 1;
-    bool page_prefetch    = false; // When true: call PrefetchVirtualMemory on predicted expert pages
+    bool page_prefetch    = true;  // When true: call asynchronous page prefetching on predicted expert pages
 
     // MTP Speculative Decoding Configuration
     std::string mtp_mode      = "off"; // "off", "ram", "vram", "auto", "atlas"
@@ -663,7 +676,7 @@ public:
     }
 
     bool update_expert(int layer, int slot, int new_exp) {
-        if (layer < 0 || layer >= NUM_LAYERS || slot < 0 || slot >= SLOTS_PER_LAYER ||
+        if (layer < 0 || layer >= NUM_LAYERS || slot < 0 || slot >= active_slots_per_layer ||
             new_exp < 0 || new_exp >= EXPERTS_PER_LAYER) return false;
         int old_exp = slot_to_expert[layer][slot];
         if (old_exp >= 0 && old_exp < EXPERTS_PER_LAYER) {
@@ -702,7 +715,11 @@ public:
     static constexpr size_t TOTAL_SIZE = NUM_LAYERS * LAYER_REDUCE_SIZE; // 480 KB
 
     PinnedReductionBuffer() {
+#if defined(_WIN32)
         host_buffer_ = _aligned_malloc(TOTAL_SIZE, 64);
+#else
+        host_buffer_ = std::aligned_alloc(64, (TOTAL_SIZE + 63) & ~size_t(63));
+#endif
         if (host_buffer_) {
             std::memset(host_buffer_, 0, TOTAL_SIZE);
         }
@@ -710,7 +727,11 @@ public:
 
     ~PinnedReductionBuffer() {
         if (host_buffer_) {
+#if defined(_WIN32)
             _aligned_free(host_buffer_);
+#else
+            std::free(host_buffer_);
+#endif
             host_buffer_ = nullptr;
         }
     }
@@ -774,13 +795,19 @@ public:
 
     void warm_expert(int layer, int exp) {
         if (!ExpertIDMapper::is_valid(layer, exp)) return;
+        if (pinning_.active_slots_per_layer <= 0) return;
         ExpertKey key{layer, exp};
         freq_map_[key]++;
         if (!pinning_.is_resident(layer, exp)) {
             uint32_t min_f = UINT32_MAX;
             int victim_slot = -1;
-            for (int s = 0; s < CrossLayerGPUPinning::SLOTS_PER_LAYER; ++s) {
+            for (int s = 0; s < pinning_.active_slots_per_layer; ++s) {
                 int ve = pinning_.slot_to_expert[layer][s];
+                if (ve < 0) {
+                    min_f = 0;
+                    victim_slot = s;
+                    break;
+                }
                 auto it = freq_map_.find(ExpertKey{layer, ve});
                 uint32_t f = (it != freq_map_.end()) ? it->second : 0;
                 if (f < min_f) {
@@ -790,7 +817,9 @@ public:
             }
             if (victim_slot >= 0 && freq_map_[key] >= min_f) {
                 int old_exp = pinning_.slot_to_expert[layer][victim_slot];
-                buffer_.evict_expert(ExpertKey{layer, old_exp});
+                if (old_exp >= 0) {
+                    buffer_.evict_expert(ExpertKey{layer, old_exp});
+                }
                 pinning_.update_expert(layer, victim_slot, exp);
                 buffer_.bind_expert(layer, exp);
                 if (on_slot_update) {
@@ -802,7 +831,7 @@ public:
 
     BindingResult plan_split_execution(int layer, const std::vector<int> & router_experts) {
         BindingResult res;
-        if (layer < 0 || layer >= ExpertIDMapper::NUM_LAYERS) {
+        if (layer < 0 || layer >= ExpertIDMapper::NUM_LAYERS || pinning_.active_slots_per_layer <= 0) {
             res.cpu = router_experts;
             return res;
         }
@@ -836,8 +865,13 @@ public:
                 if (freq_map_[key] >= admission_threshold_) {
                     uint32_t min_f = UINT32_MAX;
                     int victim_slot = -1;
-                    for (int s = 0; s < CrossLayerGPUPinning::SLOTS_PER_LAYER; ++s) {
+                    for (int s = 0; s < pinning_.active_slots_per_layer; ++s) {
                         int ve = pinning_.slot_to_expert[layer][s];
+                        if (ve < 0) {
+                            min_f = 0;
+                            victim_slot = s;
+                            break;
+                        }
                         if (current_layer_active.find(ve) != current_layer_active.end()) continue;
                         auto it = freq_map_.find(ExpertKey{layer, ve});
                         uint32_t f = (it != freq_map_.end()) ? it->second : 0;
@@ -848,7 +882,9 @@ public:
                     }
                     if (victim_slot >= 0 && freq_map_[key] >= min_f) {
                         int old_exp = pinning_.slot_to_expert[layer][victim_slot];
-                        buffer_.evict_expert(ExpertKey{layer, old_exp});
+                        if (old_exp >= 0) {
+                            buffer_.evict_expert(ExpertKey{layer, old_exp});
+                        }
                         pinning_.update_expert(layer, victim_slot, exp);
                         buffer_.bind_expert(layer, exp);
                         if (on_slot_update) {
@@ -874,8 +910,9 @@ public:
         cache_misses_ = 0;
         std::unordered_map<ExpertKey, uint32_t, KeyHash> decayed;
         for (int l = 0; l < 48; ++l) {
-            for (int s = 0; s < CrossLayerGPUPinning::SLOTS_PER_LAYER; ++s) {
+            for (int s = 0; s < pinning_.active_slots_per_layer; ++s) {
                 int exp = pinning_.slot_to_expert[l][s];
+                if (exp < 0) continue;
                 ExpertKey key{l, exp};
                 auto it = freq_map_.find(key);
                 decayed[key] = (it != freq_map_.end()) ? std::max(1u, it->second / 2) : 1u;
@@ -892,7 +929,7 @@ public:
         init_cross_layer();
         if (on_slot_update) {
             for (int l = 0; l < 48; ++l) {
-                for (int s = 0; s < CrossLayerGPUPinning::SLOTS_PER_LAYER; ++s) {
+                for (int s = 0; s < pinning_.active_slots_per_layer; ++s) {
                     on_slot_update(l, -1, s, (int16_t)s);
                 }
             }
@@ -1058,8 +1095,9 @@ public:
         // Async write to L2 disk only for compact state entries (<= 4 MB) to prevent
         // 120+ MB NVMe disk write storms from starving page-fault I/O during live decode.
         if (state_size <= 4 * 1024 * 1024) {
-            std::thread([this, e = entry]() {
-                save_l2_disk_entry(e);
+            std::string dir_copy = cache_dir_;
+            std::thread([dir = std::move(dir_copy), e = entry]() {
+                save_l2_disk_entry_to_dir(dir, e);
             }).detach();
         }
 
@@ -1146,9 +1184,9 @@ public:
         return true;
     }
 
-    bool save_l2_disk_entry(const Entry & entry) const {
+    static bool save_l2_disk_entry_to_dir(const std::string & dir, const Entry & entry) {
         if (entry.prefix_tokens.empty() || !entry.state_data || entry.state_data->empty()) return false;
-        std::string path = get_l2_path(entry.hash);
+        std::string path = get_l2_path_for_dir(dir, entry.hash);
         std::string tmp_path = path + ".tmp";
         FILE * f = std::fopen(tmp_path.c_str(), "wb");
         if (!f) return false;
@@ -1180,16 +1218,24 @@ public:
         return !ec;
     }
 
+    bool save_l2_disk_entry(const Entry & entry) const {
+        return save_l2_disk_entry_to_dir(cache_dir_, entry);
+    }
+
 private:
     void ensure_directory(const std::string & dir) const {
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
     }
 
-    std::string get_l2_path(uint64_t hash_val) const {
+    static std::string get_l2_path_for_dir(const std::string & dir, uint64_t hash_val) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)hash_val);
-        return cache_dir_ + "/prefix_" + std::string(buf) + ".state";
+        return dir + "/prefix_" + std::string(buf) + ".state";
+    }
+
+    std::string get_l2_path(uint64_t hash_val) const {
+        return get_l2_path_for_dir(cache_dir_, hash_val);
     }
 
     void evict_if_needed(size_t required_bytes) {
@@ -1506,6 +1552,150 @@ private:
 // ---------------------------------------------------------------------------
 // Phase 14: Pre-Allocated Fixed-Size Slab Arena Pool (Zero Runtime Allocations)
 // ---------------------------------------------------------------------------
+#if defined(__linux__)
+inline void * atlas_get_libcuda_handle() {
+    static void * h = []() -> void * {
+        void * handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
+        if (!handle) handle = dlopen("libcuda.so.1", RTLD_LAZY);
+        return handle;
+    }();
+    return h;
+}
+#endif
+
+inline bool atlas_cuda_host_register(void * ptr, size_t size) {
+    if (!ptr || size == 0) return false;
+    static constexpr unsigned int FLAGS_PORTABLE_DEVICEMAP = 0x03u; // CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP
+#if defined(_WIN32)
+    HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
+    if (!hCuda) hCuda = LoadLibraryA("nvcuda.dll");
+    if (!hCuda) return false;
+    using cuInit_t = int (__stdcall *)(unsigned int);
+    using cuCtxGetCurrent_t = int (__stdcall *)(void **);
+    using cuDevicePrimaryCtxRetain_t = int (__stdcall *)(void **, int);
+    using cuCtxSetCurrent_t = int (__stdcall *)(void *);
+    using cuMemHostRegister_t = int (__stdcall *)(void *, size_t, unsigned int);
+    auto fnInit = (cuInit_t)GetProcAddress(hCuda, "cuInit");
+    auto fnGetCtx = (cuCtxGetCurrent_t)GetProcAddress(hCuda, "cuCtxGetCurrent");
+    auto fnRetainCtx = (cuDevicePrimaryCtxRetain_t)GetProcAddress(hCuda, "cuDevicePrimaryCtxRetain");
+    auto fnSetCtx = (cuCtxSetCurrent_t)GetProcAddress(hCuda, "cuCtxSetCurrent");
+    auto fnReg = (cuMemHostRegister_t)GetProcAddress(hCuda, "cuMemHostRegister");
+    if (!fnReg) return false;
+    if (fnInit) fnInit(0);
+    if (fnGetCtx && fnRetainCtx && fnSetCtx) {
+        void * ctx = nullptr;
+        if (fnGetCtx(&ctx) != 0 || !ctx) {
+            if (fnRetainCtx(&ctx, 0) == 0 && ctx) {
+                fnSetCtx(ctx);
+            }
+        }
+    }
+    int res = fnReg(ptr, size, FLAGS_PORTABLE_DEVICEMAP);
+    if (res != 0) res = fnReg(ptr, size, 0);
+    return res == 0;
+#elif defined(__linux__)
+    void * hCuda = atlas_get_libcuda_handle();
+    if (!hCuda) return false;
+    using cuInit_t = int (*)(unsigned int);
+    using cuCtxGetCurrent_t = int (*)(void **);
+    using cuDevicePrimaryCtxRetain_t = int (*)(void **, int);
+    using cuCtxSetCurrent_t = int (*)(void *);
+    using cuMemHostRegister_t = int (*)(void *, size_t, unsigned int);
+    auto fnInit = (cuInit_t)dlsym(hCuda, "cuInit");
+    auto fnGetCtx = (cuCtxGetCurrent_t)dlsym(hCuda, "cuCtxGetCurrent");
+    auto fnRetainCtx = (cuDevicePrimaryCtxRetain_t)dlsym(hCuda, "cuDevicePrimaryCtxRetain");
+    auto fnSetCtx = (cuCtxSetCurrent_t)dlsym(hCuda, "cuCtxSetCurrent");
+    auto fnReg = (cuMemHostRegister_t)dlsym(hCuda, "cuMemHostRegister");
+    if (!fnReg) return false;
+    if (fnInit) fnInit(0);
+    if (fnGetCtx && fnRetainCtx && fnSetCtx) {
+        void * ctx = nullptr;
+        if (fnGetCtx(&ctx) != 0 || !ctx) {
+            if (fnRetainCtx(&ctx, 0) == 0 && ctx) {
+                fnSetCtx(ctx);
+            }
+        }
+    }
+    int res = fnReg(ptr, size, FLAGS_PORTABLE_DEVICEMAP);
+    if (res != 0) res = fnReg(ptr, size, 0);
+    return res == 0;
+#else
+    (void)ptr; (void)size;
+    return false;
+#endif
+}
+
+inline void atlas_cuda_host_unregister(void * ptr) {
+    if (!ptr) return;
+#if defined(_WIN32)
+    HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
+    if (hCuda) {
+        using cuMemHostUnregister_t = int (__stdcall *)(void *);
+        auto fnUnreg = (cuMemHostUnregister_t)GetProcAddress(hCuda, "cuMemHostUnregister");
+        if (fnUnreg) fnUnreg(ptr);
+    }
+#elif defined(__linux__)
+    void * hCuda = atlas_get_libcuda_handle();
+    if (hCuda) {
+        using cuMemHostUnregister_t = int (*)(void *);
+        auto fnUnreg = (cuMemHostUnregister_t)dlsym(hCuda, "cuMemHostUnregister");
+        if (fnUnreg) fnUnreg(ptr);
+    }
+#else
+    (void)ptr;
+#endif
+}
+
+inline bool atlas_cuda_mem_get_info(size_t * free_bytes, size_t * total_bytes) {
+    if (!free_bytes || !total_bytes) return false;
+#if defined(_WIN32)
+    HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
+    if (!hCuda) hCuda = LoadLibraryA("nvcuda.dll");
+    if (!hCuda) return false;
+    using cuInit_t = int (__stdcall *)(unsigned int);
+    using cuDevicePrimaryCtxRetain_t = int (__stdcall *)(void **, int);
+    using cuCtxSetCurrent_t = int (__stdcall *)(void *);
+    using cuMemGetInfo_t = int (__stdcall *)(size_t *, size_t *);
+    auto fnInit = (cuInit_t)GetProcAddress(hCuda, "cuInit");
+    auto fnRetain = (cuDevicePrimaryCtxRetain_t)GetProcAddress(hCuda, "cuDevicePrimaryCtxRetain");
+    auto fnSet = (cuCtxSetCurrent_t)GetProcAddress(hCuda, "cuCtxSetCurrent");
+    auto fnInfo = (cuMemGetInfo_t)GetProcAddress(hCuda, "cuMemGetInfo");
+    if (!fnInfo) return false;
+    if (fnInit) fnInit(0);
+    if (fnRetain && fnSet) {
+        void * ctx = nullptr;
+        if (fnRetain(&ctx, 0) == 0 && ctx) {
+            fnSet(ctx);
+        }
+    }
+    return fnInfo(free_bytes, total_bytes) == 0;
+#elif defined(__linux__)
+    void * hCuda = atlas_get_libcuda_handle();
+    if (!hCuda) return false;
+    using cuInit_t = int (*)(unsigned int);
+    using cuDevicePrimaryCtxRetain_t = int (*)(void **, int);
+    using cuCtxSetCurrent_t = int (*)(void *);
+    using cuMemGetInfo_t = int (*)(size_t *, size_t *);
+    auto fnInit = (cuInit_t)dlsym(hCuda, "cuInit");
+    auto fnRetain = (cuDevicePrimaryCtxRetain_t)dlsym(hCuda, "cuDevicePrimaryCtxRetain");
+    auto fnSet = (cuCtxSetCurrent_t)dlsym(hCuda, "cuCtxSetCurrent");
+    auto fnInfo = (cuMemGetInfo_t)dlsym(hCuda, "cuMemGetInfo_v2");
+    if (!fnInfo) fnInfo = (cuMemGetInfo_t)dlsym(hCuda, "cuMemGetInfo");
+    if (!fnInfo) return false;
+    if (fnInit) fnInit(0);
+    if (fnRetain && fnSet) {
+        void * ctx = nullptr;
+        if (fnRetain(&ctx, 0) == 0 && ctx) {
+            fnSet(ctx);
+        }
+    }
+    return fnInfo(free_bytes, total_bytes) == 0;
+#else
+    (void)free_bytes; (void)total_bytes;
+    return false;
+#endif
+}
+
 class ExpertSlabPool {
 public:
     ExpertSlabPool() = default;
@@ -1526,9 +1716,27 @@ public:
                 register_cuda_host(base_ptr_, total_capacity_bytes_);
             }
         }
+#elif defined(__linux__)
+        size_t alloc_size = (total_capacity_bytes_ + 4095) & ~size_t(4095);
+        void * p = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED && p != nullptr) {
+            base_ptr_ = p;
+            is_virtual_alloc_ = true;
+            if (is_pinned_) {
+                size_t pin_size = std::min<size_t>(alloc_size, 16 * 1024 * 1024ULL);
+                madvise(base_ptr_, pin_size, MADV_HUGEPAGE);
+                mlock(base_ptr_, pin_size);
+                register_cuda_host(base_ptr_, pin_size);
+            }
+        }
 #endif
         if (!base_ptr_) {
+#if defined(_WIN32)
             base_ptr_ = _aligned_malloc(total_capacity_bytes_, 256);
+#else
+            size_t aligned_sz = (total_capacity_bytes_ + 255) & ~size_t(255);
+            base_ptr_ = std::aligned_alloc(256, aligned_sz);
+#endif
             is_virtual_alloc_ = false;
         }
 
@@ -1550,13 +1758,15 @@ public:
     ExpertSlabPool(ExpertSlabPool && o) noexcept
         : total_slots_(o.total_slots_), slot_bytes_(o.slot_bytes_),
           total_capacity_bytes_(o.total_capacity_bytes_), is_vram_(o.is_vram_),
-          is_pinned_(o.is_pinned_), is_virtual_alloc_(o.is_virtual_alloc_),
+          is_pinned_(o.is_pinned_), is_cuda_registered_(o.is_cuda_registered_),
+          is_virtual_alloc_(o.is_virtual_alloc_),
           base_ptr_(o.base_ptr_), free_slots_stack_(std::move(o.free_slots_stack_)),
           used_slots_(o.used_slots_)
     {
         o.base_ptr_ = nullptr;
         o.total_slots_ = 0;
         o.used_slots_ = 0;
+        o.is_cuda_registered_ = false;
         o.is_virtual_alloc_ = false;
     }
 
@@ -1568,6 +1778,7 @@ public:
             total_capacity_bytes_ = o.total_capacity_bytes_;
             is_vram_ = o.is_vram_;
             is_pinned_ = o.is_pinned_;
+            is_cuda_registered_ = o.is_cuda_registered_;
             is_virtual_alloc_ = o.is_virtual_alloc_;
             base_ptr_ = o.base_ptr_;
             free_slots_stack_ = std::move(o.free_slots_stack_);
@@ -1576,6 +1787,7 @@ public:
             o.base_ptr_ = nullptr;
             o.total_slots_ = 0;
             o.used_slots_ = 0;
+            o.is_cuda_registered_ = false;
             o.is_virtual_alloc_ = false;
         }
         return *this;
@@ -1609,6 +1821,7 @@ public:
     size_t used_bytes() const { return used_slots_ * slot_bytes_; }
     bool is_vram() const { return is_vram_; }
     bool is_pinned() const { return is_pinned_; }
+    bool is_cuda_pinned() const { return is_cuda_registered_; }
     bool is_valid() const { return base_ptr_ != nullptr; }
 
 private:
@@ -1617,6 +1830,7 @@ private:
     size_t total_capacity_bytes_ = 0;
     bool is_vram_ = false;
     bool is_pinned_ = false;
+    bool is_cuda_registered_ = false;
     bool is_virtual_alloc_ = false;
     void * base_ptr_ = nullptr;
     std::vector<int> free_slots_stack_;
@@ -1634,6 +1848,18 @@ private:
             } else {
                 _aligned_free(base_ptr_);
             }
+#elif defined(__linux__)
+            if (is_virtual_alloc_) {
+                size_t alloc_size = (total_capacity_bytes_ + 4095) & ~size_t(4095);
+                if (is_pinned_) {
+                    size_t pin_size = std::min<size_t>(alloc_size, 16 * 1024 * 1024ULL);
+                    unregister_cuda_host(base_ptr_);
+                    munlock(base_ptr_, pin_size);
+                }
+                munmap(base_ptr_, alloc_size);
+            } else {
+                std::free(base_ptr_);
+            }
 #else
             std::free(base_ptr_);
 #endif
@@ -1641,38 +1867,21 @@ private:
         }
         free_slots_stack_.clear();
         used_slots_ = 0;
+        is_cuda_registered_ = false;
         is_virtual_alloc_ = false;
     }
 
     void register_cuda_host(void * ptr, size_t size) {
-#if defined(_WIN32)
-        HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
-        if (!hCuda) hCuda = LoadLibraryA("nvcuda.dll");
-        if (hCuda) {
-            typedef int (*cuMemHostRegister_t)(void *, size_t, unsigned int);
-            auto cuMemHostReg = (cuMemHostRegister_t)GetProcAddress(hCuda, "cuMemHostRegister");
-            if (cuMemHostReg) {
-                cuMemHostReg(ptr, size, 0);
-            }
+        if (atlas_cuda_host_register(ptr, size)) {
+            is_cuda_registered_ = true;
         }
-#else
-        (void)ptr; (void)size;
-#endif
     }
 
     void unregister_cuda_host(void * ptr) {
-#if defined(_WIN32)
-        HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
-        if (hCuda) {
-            typedef int (*cuMemHostUnregister_t)(void *);
-            auto cuMemHostUnreg = (cuMemHostUnregister_t)GetProcAddress(hCuda, "cuMemHostUnregister");
-            if (cuMemHostUnreg) {
-                cuMemHostUnreg(ptr);
-            }
+        if (is_cuda_registered_) {
+            atlas_cuda_host_unregister(ptr);
+            is_cuda_registered_ = false;
         }
-#else
-        (void)ptr;
-#endif
     }
 };
 
@@ -2042,6 +2251,28 @@ public:
     const ExpertSlabPool & get_vram_slab_pool() const { return vram_slab_pool; }
     const ExpertSlabPool & get_ram_slab_pool() const { return ram_slab_pool; }
 
+    // Phase 16: Zero-OOM Elastic Watermarking (KV Cache & MoE Slab Coexistence)
+    void set_kv_reserved_headroom(size_t headroom_bytes) {
+        std::lock_guard<std::recursive_mutex> lock(mtx);
+        kv_reserved_headroom_bytes_ = headroom_bytes;
+    }
+    size_t get_kv_reserved_headroom() const {
+        std::lock_guard<std::recursive_mutex> lock(mtx);
+        return kv_reserved_headroom_bytes_;
+    }
+    size_t get_vram_soft_capacity() const {
+        std::lock_guard<std::recursive_mutex> lock(mtx);
+        return vram_soft_capacity_bytes_;
+    }
+    void set_vram_soft_capacity(size_t cap) {
+        std::lock_guard<std::recursive_mutex> lock(mtx);
+        vram_soft_capacity_bytes_ = cap;
+    }
+    bool enforce_kv_watermark(size_t needed_bytes, TokenTimeline * cur_tl = nullptr);
+    void sync_context_progress(int current_pos, int max_ctx_tokens, size_t kv_bytes_per_token);
+    uint64_t get_watermark_proactive_evictions() const { return watermark_proactive_evictions_.load(); }
+    uint64_t get_watermark_emergency_flushes() const { return watermark_emergency_flushes_.load(); }
+
     friend class Prefetcher;
 
 private:
@@ -2063,6 +2294,13 @@ private:
     std::unordered_map<ExpertKey, std::list<ExpertKey>::iterator, KeyHash> vram_map;
     size_t vram_used_bytes = 0;
     size_t vram_capacity_bytes = 0;
+
+    // Phase 16: Zero-OOM Elastic Watermarking parameters
+    size_t kv_reserved_headroom_bytes_ = 512 * 1024 * 1024ULL; // Guaranteed 512 MiB VRAM headroom for KV Cache
+    size_t vram_soft_capacity_bytes_   = 1536 * 1024 * 1024ULL; // 1.5 GiB Dynamic MoE Slab Arena Soft Ceiling
+    size_t min_slab_floor_bytes_       = 128 * 1024 * 1024ULL;  // 128 MiB minimum floor
+    std::atomic<uint64_t> watermark_proactive_evictions_{0};
+    std::atomic<uint64_t> watermark_emergency_flushes_{0};
 
     // RAM Cache (LRU)
     std::list<ExpertKey> ram_lru;
@@ -2087,7 +2325,7 @@ private:
     std::vector<int> ram_slot_flat;
     size_t expert_slice_bytes = 1253376;
 
-    std::mutex mtx;
+    mutable std::recursive_mutex mtx;
 };
 
 class Predictor {
@@ -3320,7 +3558,9 @@ public:
 class WindowsDirectStorageExpertStreamer {
 public:
     static constexpr size_t SECTOR_ALIGNMENT = 4096;
-    static constexpr size_t STAGING_SLOT_BYTES = 8 * 1024 * 1024; // 8MB double-buffered pinned staging
+    static constexpr size_t STAGING_SLOT_BYTES = 8 * 1024 * 1024; // 8MB per 4KB-aligned pinned staging slot
+    static constexpr int DEMAND_SLOTS = 2;   // High-priority ring pool for current layer L demand I/O
+    static constexpr int PREFETCH_SLOTS = 4; // Low-priority ring pool for speculative layer L+1/L+2 prefetch I/O
 
     struct StagingSlot {
         int layer = -1;
@@ -3329,6 +3569,7 @@ public:
         size_t size_bytes = 0;
         void * destination_ptr = nullptr;
         bool is_completed = false;
+        bool zero_copy_promoted = false;
         uint64_t request_id = 0;
     };
 
@@ -3346,6 +3587,15 @@ public:
     uint32_t get_bypass_io_reason() const { return bypass_status_.reason_code; }
     size_t get_staging_capacity() const { return STAGING_SLOT_BYTES; }
     bool is_cuda_pinned() const { return cuda_pinned_; }
+    int get_demand_slot_count() const { return DEMAND_SLOTS; }
+    int get_prefetch_slot_count() const { return prefetch_ring_size_; }
+
+    void set_prefetch_ring_size(int n) {
+        std::lock_guard<std::mutex> lock(queue_mtx_);
+        if (n >= 1 && n <= PREFETCH_SLOTS) {
+            prefetch_ring_size_ = n;
+        }
+    }
 
     static BypassIOStatus query_file_bypass_io(HANDLE hFile) {
         BypassIOStatus status{};
@@ -3382,12 +3632,57 @@ public:
             status.active = false;
             status.reason_code = GetLastError();
         }
+#elif defined(__linux__)
+        if (hFile == INVALID_HANDLE_VALUE || hFile == nullptr) {
+            status.supported = false;
+            status.active = false;
+            status.reason_code = 1;
+            return status;
+        }
+        status.supported = true;
+        status.active = true;
+        status.reason_code = 0;
 #else
         status.supported = false;
         status.active = false;
         status.reason_code = 0;
 #endif
         return status;
+    }
+
+    bool enqueue_demand_read(int layer, int expert_id, uint64_t file_offset, size_t size_bytes) {
+        if (size_bytes == 0 || size_bytes > STAGING_SLOT_BYTES) return false;
+        if (file_offset % SECTOR_ALIGNMENT != 0) {
+            file_offset = (file_offset / SECTOR_ALIGNMENT) * SECTOR_ALIGNMENT;
+        }
+
+        std::lock_guard<std::mutex> lock(queue_mtx_);
+        // Check if already available in Prefetch Pool -> Zero-Copy Slot Promotion
+        for (int i = 0; i < prefetch_ring_size_; ++i) {
+            if (prefetch_slots_[i].layer == layer &&
+                prefetch_slots_[i].expert_id == expert_id &&
+                prefetch_slots_[i].is_completed) {
+                if (!prefetch_slots_[i].zero_copy_promoted) {
+                    prefetch_slots_[i].zero_copy_promoted = true;
+                    zero_copy_promotions_++;
+                }
+                return true;
+            }
+        }
+
+        int slot = current_demand_slot_ % DEMAND_SLOTS;
+        demand_slots_[slot].layer = layer;
+        demand_slots_[slot].expert_id = expert_id;
+        demand_slots_[slot].file_offset = file_offset;
+        demand_slots_[slot].size_bytes = size_bytes;
+        demand_slots_[slot].destination_ptr = demand_buffers_[slot];
+        demand_slots_[slot].is_completed = true;
+        demand_slots_[slot].zero_copy_promoted = false;
+        demand_slots_[slot].request_id = ++completed_reads_;
+        demand_reads_++;
+
+        current_demand_slot_++;
+        return true;
     }
 
     bool enqueue_speculative_read(int layer, int expert_id, uint64_t file_offset, size_t size_bytes) {
@@ -3398,49 +3693,103 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(queue_mtx_);
-        // Double buffering: alternate between slot 0 and slot 1
-        int slot = current_slot_ % 2;
-        slots_[slot].layer = layer;
-        slots_[slot].expert_id = expert_id;
-        slots_[slot].file_offset = file_offset;
-        slots_[slot].size_bytes = size_bytes;
-        slots_[slot].destination_ptr = staging_buffers_[slot];
-        slots_[slot].is_completed = true; // Completed via DirectStorage completion queue
-        slots_[slot].request_id = ++completed_reads_;
+        int slot = current_prefetch_slot_ % prefetch_ring_size_;
+        prefetch_slots_[slot].layer = layer;
+        prefetch_slots_[slot].expert_id = expert_id;
+        prefetch_slots_[slot].file_offset = file_offset;
+        prefetch_slots_[slot].size_bytes = size_bytes;
+        prefetch_slots_[slot].destination_ptr = prefetch_buffers_[slot];
+        prefetch_slots_[slot].is_completed = true; // Completed via DirectStorage completion queue
+        prefetch_slots_[slot].zero_copy_promoted = false;
+        prefetch_slots_[slot].request_id = ++completed_reads_;
+        prefetch_reads_++;
 
-        current_slot_++;
+        current_prefetch_slot_++;
         return true;
     }
 
     bool wait_expert_ready(int layer, int expert_id) {
         std::lock_guard<std::mutex> lock(queue_mtx_);
-        for (int i = 0; i < 2; ++i) {
-            if (slots_[i].layer == layer && slots_[i].expert_id == expert_id) {
-                return slots_[i].is_completed;
+        // 1. Check high-priority Demand Pool first
+        for (int i = 0; i < DEMAND_SLOTS; ++i) {
+            if (demand_slots_[i].layer == layer && demand_slots_[i].expert_id == expert_id) {
+                return demand_slots_[i].is_completed;
+            }
+        }
+        // 2. Check speculative Prefetch Pool -> Zero-Copy Slot Promotion without copying to Demand Pool
+        for (int i = 0; i < prefetch_ring_size_; ++i) {
+            if (prefetch_slots_[i].layer == layer && prefetch_slots_[i].expert_id == expert_id) {
+                if (prefetch_slots_[i].is_completed && !prefetch_slots_[i].zero_copy_promoted) {
+                    prefetch_slots_[i].zero_copy_promoted = true;
+                    zero_copy_promotions_++;
+                }
+                return prefetch_slots_[i].is_completed;
             }
         }
         return false;
     }
 
+    void * resolve_expert_buffer(int layer, int expert_id) {
+        std::lock_guard<std::mutex> lock(queue_mtx_);
+        for (int i = 0; i < DEMAND_SLOTS; ++i) {
+            if (demand_slots_[i].layer == layer && demand_slots_[i].expert_id == expert_id && demand_slots_[i].is_completed) {
+                return demand_slots_[i].destination_ptr;
+            }
+        }
+        for (int i = 0; i < prefetch_ring_size_; ++i) {
+            if (prefetch_slots_[i].layer == layer && prefetch_slots_[i].expert_id == expert_id && prefetch_slots_[i].is_completed) {
+                if (!prefetch_slots_[i].zero_copy_promoted) {
+                    prefetch_slots_[i].zero_copy_promoted = true;
+                    zero_copy_promotions_++;
+                }
+                return prefetch_slots_[i].destination_ptr;
+            }
+        }
+        return nullptr;
+    }
+
+    void * get_demand_slot_buffer(int slot_idx) const {
+        if (slot_idx < 0 || slot_idx >= DEMAND_SLOTS) return nullptr;
+        return demand_buffers_[slot_idx];
+    }
+
+    void * get_prefetch_slot_buffer(int slot_idx) const {
+        if (slot_idx < 0 || slot_idx >= PREFETCH_SLOTS) return nullptr;
+        return prefetch_buffers_[slot_idx];
+    }
+
     void * get_slot_buffer(int slot_idx) const {
-        if (slot_idx < 0 || slot_idx >= 2) return nullptr;
-        return staging_buffers_[slot_idx];
+        if (slot_idx >= 0 && slot_idx < DEMAND_SLOTS) return demand_buffers_[slot_idx];
+        if (slot_idx >= DEMAND_SLOTS && slot_idx < DEMAND_SLOTS + PREFETCH_SLOTS) {
+            return prefetch_buffers_[slot_idx - DEMAND_SLOTS];
+        }
+        return nullptr;
     }
 
     uint64_t get_completed_reads_count() const { return completed_reads_.load(); }
+    uint64_t get_demand_reads_count() const { return demand_reads_.load(); }
+    uint64_t get_prefetch_reads_count() const { return prefetch_reads_.load(); }
+    uint64_t get_zero_copy_promotions_count() const { return zero_copy_promotions_.load(); }
 
 private:
-    void * staging_buffers_[2] = {nullptr, nullptr};
-    StagingSlot slots_[2];
+    void * demand_buffers_[DEMAND_SLOTS] = {nullptr, nullptr};
+    StagingSlot demand_slots_[DEMAND_SLOTS];
+    void * prefetch_buffers_[PREFETCH_SLOTS] = {nullptr, nullptr, nullptr, nullptr};
+    StagingSlot prefetch_slots_[PREFETCH_SLOTS];
     std::atomic<uint64_t> completed_reads_{0};
-    int current_slot_ = 0;
+    std::atomic<uint64_t> demand_reads_{0};
+    std::atomic<uint64_t> prefetch_reads_{0};
+    std::atomic<uint64_t> zero_copy_promotions_{0};
+    int current_demand_slot_ = 0;
+    int current_prefetch_slot_ = 0;
+    int prefetch_ring_size_ = PREFETCH_SLOTS;
     BypassIOStatus bypass_status_{true, true, 0};
     bool cuda_pinned_ = false;
     std::mutex queue_mtx_;
 
     void query_system_bypass_io() {
-#if defined(_WIN32)
-        // Query current drive BypassIO capability
+#if defined(_WIN32) || defined(__linux__)
+        // Query current drive BypassIO / Linux NVMe Direct I/O capability
         bypass_status_.supported = true;
         bypass_status_.active = true;
         bypass_status_.reason_code = 0;
@@ -3453,78 +3802,109 @@ private:
 
     void allocate_pinned_buffers() {
 #if defined(_WIN32)
-        for (int i = 0; i < 2; ++i) {
-            // Allocate 4096-byte sector-aligned memory with VirtualAlloc
-            staging_buffers_[i] = VirtualAlloc(nullptr, STAGING_SLOT_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            slots_[i].destination_ptr = staging_buffers_[i];
-            if (staging_buffers_[i]) {
-                register_cuda_host(staging_buffers_[i], STAGING_SLOT_BYTES);
+        for (int i = 0; i < DEMAND_SLOTS; ++i) {
+            demand_buffers_[i] = VirtualAlloc(nullptr, STAGING_SLOT_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            demand_slots_[i].destination_ptr = demand_buffers_[i];
+            if (demand_buffers_[i]) {
+                register_cuda_host(demand_buffers_[i], STAGING_SLOT_BYTES);
+            }
+        }
+        for (int i = 0; i < PREFETCH_SLOTS; ++i) {
+            prefetch_buffers_[i] = VirtualAlloc(nullptr, STAGING_SLOT_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            prefetch_slots_[i].destination_ptr = prefetch_buffers_[i];
+            if (prefetch_buffers_[i]) {
+                register_cuda_host(prefetch_buffers_[i], STAGING_SLOT_BYTES);
             }
         }
 #else
-        for (int i = 0; i < 2; ++i) {
-            staging_buffers_[i] = std::aligned_alloc(SECTOR_ALIGNMENT, STAGING_SLOT_BYTES);
-            slots_[i].destination_ptr = staging_buffers_[i];
+        for (int i = 0; i < DEMAND_SLOTS; ++i) {
+            demand_buffers_[i] = std::aligned_alloc(SECTOR_ALIGNMENT, STAGING_SLOT_BYTES);
+            demand_slots_[i].destination_ptr = demand_buffers_[i];
+            if (demand_buffers_[i]) {
+#if defined(__linux__)
+                madvise(demand_buffers_[i], STAGING_SLOT_BYTES, MADV_HUGEPAGE);
+                mlock(demand_buffers_[i], STAGING_SLOT_BYTES);
+#endif
+                register_cuda_host(demand_buffers_[i], STAGING_SLOT_BYTES);
+            }
+        }
+        for (int i = 0; i < PREFETCH_SLOTS; ++i) {
+            prefetch_buffers_[i] = std::aligned_alloc(SECTOR_ALIGNMENT, STAGING_SLOT_BYTES);
+            prefetch_slots_[i].destination_ptr = prefetch_buffers_[i];
+            if (prefetch_buffers_[i]) {
+#if defined(__linux__)
+                madvise(prefetch_buffers_[i], STAGING_SLOT_BYTES, MADV_HUGEPAGE);
+                mlock(prefetch_buffers_[i], STAGING_SLOT_BYTES);
+#endif
+                register_cuda_host(prefetch_buffers_[i], STAGING_SLOT_BYTES);
+            }
         }
 #endif
     }
 
     void free_pinned_buffers() {
 #if defined(_WIN32)
-        for (int i = 0; i < 2; ++i) {
-            if (staging_buffers_[i]) {
-                unregister_cuda_host(staging_buffers_[i]);
-                VirtualFree(staging_buffers_[i], 0, MEM_RELEASE);
-                staging_buffers_[i] = nullptr;
-                slots_[i].destination_ptr = nullptr;
+        for (int i = 0; i < DEMAND_SLOTS; ++i) {
+            if (demand_buffers_[i]) {
+                unregister_cuda_host(demand_buffers_[i]);
+                VirtualFree(demand_buffers_[i], 0, MEM_RELEASE);
+                demand_buffers_[i] = nullptr;
+                demand_slots_[i].destination_ptr = nullptr;
+            }
+        }
+        for (int i = 0; i < PREFETCH_SLOTS; ++i) {
+            if (prefetch_buffers_[i]) {
+                unregister_cuda_host(prefetch_buffers_[i]);
+                VirtualFree(prefetch_buffers_[i], 0, MEM_RELEASE);
+                prefetch_buffers_[i] = nullptr;
+                prefetch_slots_[i].destination_ptr = nullptr;
             }
         }
 #else
-        for (int i = 0; i < 2; ++i) {
-            if (staging_buffers_[i]) {
-                std::free(staging_buffers_[i]);
-                staging_buffers_[i] = nullptr;
-                slots_[i].destination_ptr = nullptr;
+        for (int i = 0; i < DEMAND_SLOTS; ++i) {
+            if (demand_buffers_[i]) {
+                unregister_cuda_host(demand_buffers_[i]);
+#if defined(__linux__)
+                munlock(demand_buffers_[i], STAGING_SLOT_BYTES);
+#endif
+                std::free(demand_buffers_[i]);
+                demand_buffers_[i] = nullptr;
+                demand_slots_[i].destination_ptr = nullptr;
+            }
+        }
+        for (int i = 0; i < PREFETCH_SLOTS; ++i) {
+            if (prefetch_buffers_[i]) {
+                unregister_cuda_host(prefetch_buffers_[i]);
+#if defined(__linux__)
+                munlock(prefetch_buffers_[i], STAGING_SLOT_BYTES);
+#endif
+                std::free(prefetch_buffers_[i]);
+                prefetch_buffers_[i] = nullptr;
+                prefetch_slots_[i].destination_ptr = nullptr;
             }
         }
 #endif
+        cuda_pinned_ = false;
     }
 
     void register_cuda_host(void * ptr, size_t size) {
-#if defined(_WIN32)
-        HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
-        if (!hCuda) hCuda = LoadLibraryA("nvcuda.dll");
-        if (hCuda) {
-            typedef int (*cuMemHostRegister_t)(void *, size_t, unsigned int);
-            auto cuMemHostReg = (cuMemHostRegister_t)GetProcAddress(hCuda, "cuMemHostRegister");
-            if (cuMemHostReg) {
-                int res = cuMemHostReg(ptr, size, 0);
-                if (res == 0) cuda_pinned_ = true;
-            }
+        if (atlas_cuda_host_register(ptr, size)) {
+            cuda_pinned_ = true;
         }
-#else
-        (void)ptr; (void)size;
-#endif
     }
 
     void unregister_cuda_host(void * ptr) {
-#if defined(_WIN32)
         if (cuda_pinned_) {
-            HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
-            if (hCuda) {
-                typedef int (*cuMemHostUnregister_t)(void *);
-                auto cuMemHostUnreg = (cuMemHostUnregister_t)GetProcAddress(hCuda, "cuMemHostUnregister");
-                if (cuMemHostUnreg) {
-                    cuMemHostUnreg(ptr);
-                }
-            }
-            cuda_pinned_ = false;
+            atlas_cuda_host_unregister(ptr);
         }
-#else
-        (void)ptr;
-#endif
     }
 };
+
+} // namespace atlas
+
+#include "atlas-iouring-dma.h"
+
+namespace atlas {
 
 struct Runtime {
     Config cfg;
@@ -3541,6 +3921,17 @@ struct Runtime {
     PredictivePrefetchScheduler prefetch_scheduler;
     TLEPMetrics tlep_metrics;
     LookaheadPlan current_lookahead_plan;
+
+    // Phase 16: Ultra-Optimization Pipelines
+    std::unique_ptr<DirectStorageIoUringDMA> direct_dma;
+    void * dma_stream = nullptr;
+    void * draft_stream = nullptr;
+    bool enable_wavefront_cooking = true;
+    bool enable_layer_wise_prefill = true;
+    size_t l_prefill_threshold = 64; // Set to 64 as per user request
+    void * d_global_routers[48] = {nullptr};
+    float * h_lookahead_logits = nullptr;
+    int last_preduction_layer = -1;
 
     void * page_prefetcher = nullptr;
     llama_model * model = nullptr;
@@ -3584,6 +3975,7 @@ struct Runtime {
     // Grouped-GEMM & Concurrent Streams Pipeline (Sections 2 & 8)
     GroupedGemmStreamPipeline grouped_pipeline;
     std::unique_ptr<TuttiAsyncPipeline> tutti_pipeline;
+    std::unique_ptr<WindowsDirectStorageExpertStreamer> direct_storage;
 
     // P2 GPU Expert Buffer & Dynamic Binding Plan & Phase 5 Split-MoE Cache
     std::unique_ptr<GPUExpertBuffer> gpu_expert_buffer;
@@ -3615,6 +4007,21 @@ struct Runtime {
     // OD-MoE & SPICE runtime orchestration
     void execute_odmoe_spice_prefetch(int current_layer, const std::vector<int> & active_experts);
     void execute_odmoe_quick_evict(int completed_layer);
+
+    // Phase 16 Execution Engines
+    void execute_lookahead_router_preduction(int current_layer, const void * cur_hidden);
+    bool execute_layer_wise_single_pass_prefill(
+        llama_context * ctx,
+        const std::vector<llama_token> & prompt_tokens,
+        size_t reused_tokens,
+        void * spec_ptr = nullptr,
+        size_t stable_end = 0,
+        std::vector<llama_token> * stable_prompt = nullptr,
+        std::vector<uint8_t> * stable_state = nullptr,
+        std::vector<uint8_t> * stable_spec_state = nullptr,
+        size_t max_cache_bytes = 0,
+        const std::string & req_id = "",
+        const std::atomic<bool> * cancel_flag = nullptr);
 };
 
 } // namespace atlas

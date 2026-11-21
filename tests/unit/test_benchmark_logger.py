@@ -342,3 +342,9 @@ def test_server_kv_cache_flags_generation():
     assert b2.cache_type_k is None
     assert b4.cache_type_k == "q8_0"
 
+    b5 = AtlasSubprocessBackend(ctx_size=16384, fp8_kv=True, moe_cache_cpu_share="0.50", ffn_chunk_size=512, no_sync_cache=True)
+    assert b5.fp8_kv is True
+    assert b5.moe_cache_cpu_share == "0.50"
+    assert b5.ffn_chunk_size == 512
+    assert b5.no_sync_cache is True
+

@@ -54,29 +54,31 @@ def probe_hardware() -> HardwareProfile:
     vram_free_mb = 0.0
 
     try:
-        if is_win:
-            nvml = ctypes.CDLL("nvml.dll")
-            nvml.nvmlInit_v2()
-            handle = ctypes.c_void_p()
-            nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle))
+        nvml = ctypes.CDLL("nvml.dll" if is_win else "libnvidia-ml.so.1")
+        nvml.nvmlInit_v2()
+        handle = ctypes.c_void_p()
+        nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle))
 
-            # Name
-            name_buf = ctypes.create_string_buffer(64)
-            nvml.nvmlDeviceGetName(handle, name_buf, 64)
-            gpu_name = name_buf.value.decode("utf-8", errors="ignore")
+        # Name
+        name_buf = ctypes.create_string_buffer(64)
+        nvml.nvmlDeviceGetName(handle, name_buf, 64)
+        gpu_name = name_buf.value.decode("utf-8", errors="ignore")
 
-            # Memory
-            class Memory(ctypes.Structure):
-                _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+        # Memory
+        class Memory(ctypes.Structure):
+            _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
-            mem = Memory()
-            nvml.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem))
-            vram_total_mb = mem.total / (1024.0 * 1024.0)
-            vram_free_mb = mem.free / (1024.0 * 1024.0)
-            nvml.nvmlShutdown()
+        mem = Memory()
+        nvml.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem))
+        vram_total_mb = mem.total / (1024.0 * 1024.0)
+        vram_free_mb = mem.free / (1024.0 * 1024.0)
+        if vram_total_mb > 0:
             has_gpu = True
     except Exception:
-        # Fallback to nvidia-smi if NVML dll direct call fails
+        pass
+
+    if not has_gpu:
+        # Fallback to nvidia-smi if NVML library direct call fails
         try:
             res = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
@@ -105,11 +107,23 @@ def probe_hardware() -> HardwareProfile:
     has_avx2 = True  # Safe default on all modern x86_64
 
     try:
-        # Check through cpuinfo or environment hint
         cpu_str = platform.processor().lower() + " " + platform.machine().lower()
-        if "ryzen" in cpu_str or "intel" in cpu_str or "amd" in cpu_str:
+        if not is_win and os.path.exists("/proc/cpuinfo"):
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                cpuinfo = f.read().lower()
+            cpu_str += " " + cpuinfo
+            core_ids = set()
+            for line in cpuinfo.splitlines():
+                if line.startswith("core id"):
+                    core_ids.add(line.split(":", 1)[-1].strip())
+            if core_ids:
+                physical_cores = len(core_ids)
+        if "avx512_vnni" in cpu_str or "ryzen" in cpu_str or "intel" in cpu_str or "amd" in cpu_str:
             has_vnni = True
+        if "avx512vbmi" in cpu_str or "avx512_vbmi" in cpu_str or "ryzen" in cpu_str or "intel" in cpu_str or "amd" in cpu_str:
             has_vbmi = True
+        if "avx2" in cpu_str:
+            has_avx2 = True
     except Exception:
         pass
 
@@ -139,8 +153,18 @@ def probe_hardware() -> HardwareProfile:
             ram_avail_gb = stat.ullAvailPhys / (1024.0 ** 3)
         except Exception:
             pass
+    elif os.path.exists("/proc/meminfo"):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        ram_total_gb = float(line.split()[1]) / (1024.0 * 1024.0)
+                    elif line.startswith("MemAvailable:"):
+                        ram_avail_gb = float(line.split()[1]) / (1024.0 * 1024.0)
+        except Exception:
+            pass
 
-    # 4. DirectStorage / Windows BypassIO
+    # 4. DirectStorage / Windows BypassIO / Linux NVMe Direct I/O
     ds_supported = False
     if is_win:
         try:
@@ -150,6 +174,13 @@ def probe_hardware() -> HardwareProfile:
                 ds_supported = True
         except Exception:
             pass
+    else:
+        try:
+            rel = platform.release().split(".", 2)
+            if int(rel[0]) >= 5:
+                ds_supported = True
+        except Exception:
+            ds_supported = True
 
     return HardwareProfile(
         has_gpu=has_gpu,
@@ -238,6 +269,12 @@ def inspect_model_topology(model_path: str | Path) -> ModelTopology:
         quant_type = "IQ3_XXS"
         expert_slice_bytes = 1253376
 
+    # Explicit quant token in filename overrides default heuristic (e.g. Q4_0 MTP draft heads, IQ3_S, Q4_K_M)
+    for _qtok in ("MXFP4_MOE", "IQ4_XS", "IQ4_NL", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q4_K_S", "Q4_0", "BF16", "F16"):
+        if _qtok.lower() in name_lower:
+            quant_type = _qtok
+            break
+
     # Parse GGUF header directly if possible
     try:
         with p.open("rb") as f:
@@ -286,7 +323,9 @@ def inspect_model_topology(model_path: str | Path) -> ModelTopology:
                             f.read(1)
                         elif val_type in (2, 3):  # 2 bytes
                             f.read(2)
-                        elif val_type in (6, 12):  # 8 bytes (FLOAT32/64)
+                        elif val_type == 6:  # 4 bytes (FLOAT32)
+                            f.read(4)
+                        elif val_type == 12:  # 8 bytes (FLOAT64)
                             f.read(8)
                         elif val_type == 9:  # ARRAY
                             elem_type = struct.unpack("<I", f.read(4))[0]
@@ -343,6 +382,12 @@ class AutoTuneConfig:
     physical_map_path: Optional[str]
     rationale: Dict[str, Any]
     prompt_cache_mb: int = 512
+    moe_cache_cpu_share: str = "auto"
+    ffn_chunk_size: int = 512
+    cache_type_k: str = "f8_e4m3"
+    cache_type_v: str = "f8_e4m3"
+    vram_layer_cap: str = "auto"
+    ram_lock_policy: str = "auto"
 
 
 def solve_optimal_configuration(
@@ -415,23 +460,35 @@ def solve_optimal_configuration(
     physical_map_path = None
     if model.block_count == 40 and model.expert_count == 256:
         # Qwen3.6-35B
-        cand_35b = [
-            base_dir / "config" / "atlas_physical_map_35b_3tier.json",
-            base_dir / "config" / "atlas_physical_map_35b.json",
-            Path(r"C:\Users\Ali\WebProjects\tening\artifacts\phase11\atlas_physical_map_3tier_server.json"),
-        ]
+        if "iq4_xs" in model.quant_type.lower() or "iq4_xs" in model.model_name.lower() or "iq4xs" in model.model_name.lower():
+            cand_35b = [
+                base_dir / "config" / "atlas_physical_map_35b_iq4xs.json",
+                base_dir / "config" / "atlas_physical_map_35b_3tier.json",
+                base_dir / "config" / "atlas_physical_map_35b.json",
+            ]
+        else:
+            cand_35b = [
+                base_dir / "config" / "atlas_physical_map_35b_3tier.json",
+                base_dir / "config" / "atlas_physical_map_35b.json",
+                base_dir / "config" / "atlas_physical_map_35b_iq4xs.json",
+            ]
+        fallback_35b = None
         for c in cand_35b:
             if c.is_file():
+                if fallback_35b is None:
+                    fallback_35b = str(c)
                 try:
                     with open(c, "r", encoding="utf-8") as mf:
                         m_data = json.load(mf)
-                    # Check if map belongs to same quant or file
-                    m_file = m_data.get("file", {}).get("path", "")
-                    if model.quant_type.lower() in m_file.lower() or "35b" in m_file.lower():
+                    # Check if map belongs to same quant
+                    m_file = m_data.get("file", {}).get("path", "") or m_data.get("source", "")
+                    if model.quant_type.lower() in m_file.lower():
                         physical_map_path = str(c)
                         break
                 except Exception:
                     continue
+        if not physical_map_path and fallback_35b:
+            physical_map_path = fallback_35b
     elif model.block_count == 48 and model.expert_count == 512:
         # Qwen3.8 Flash Next
         cand_38 = [
@@ -479,9 +536,14 @@ def solve_optimal_configuration(
         "hardware_detected": f"{hw.gpu_name} ({hw.vram_total_mb:.0f} MB VRAM, {hw.vram_free_mb:.0f} MB free) / {hw.ram_total_gb:.1f} GB RAM / {threads} threads",
         "model_detected": f"{model.model_name} ({model.block_count}L x {model.expert_count}E, Top-{model.expert_used_count}, {model.quant_type})",
         "tier0_vram_cache": f"{vram_cache_mb} MB allocated for ultra-hot GPU experts",
-        "tier1_ram_cache": f"{moe_cache_mib} MB pinned host RAM via VirtualLock",
-        "tier2_nvme": "4KB DirectStorage / BypassIO streaming active",
+        "tier1_ram_cache": f"{moe_cache_mib} MB locked host RAM via ClassLRU",
+        "tier2_nvme": "Multi-worker DirectStorage / io_uring streaming active",
         "prompt_cache": f"{prompt_cache_mb} MB multi-turn prefix state cache active",
+        "kv_cache": "f8_e4m3 (FP8 E4M3) up to 32k context",
+        "cpu_share": "auto (closed-loop cost-model adaptive)",
+        "ffn_chunk_size": "512 tokens (enables ubatch >= 1024 prefill)",
+        "vram_layer_cap": "auto (Phase 18 adaptive VRAM MoE layer residency cap)",
+        "ram_lock_policy": "auto (Phase 18 adaptive host RAM lock policy)",
         "speculative": f"{mtp_mode.upper()} mode with draft_n={mtp_draft_n}",
     }
 
@@ -497,7 +559,401 @@ def solve_optimal_configuration(
         physical_map_path=physical_map_path,
         rationale=rationale,
         prompt_cache_mb=prompt_cache_mb,
+        moe_cache_cpu_share="auto",
+        ffn_chunk_size=512,
+        cache_type_k="f8_e4m3",
+        cache_type_v="f8_e4m3",
+        vram_layer_cap="auto",
+        ram_lock_policy="auto",
     )
+
+
+def _estimate_kv_budget_mb(model: ModelTopology, ctx_size: int, cache_k: str, cache_v: str) -> float:
+    """Estimate KV cache VRAM footprint in MiB for hybrid MoE models."""
+    def _bpe(q: str) -> float:
+        ql = (q or "f8_e4m3").lower()
+        if ql in ("f16", "bf16"):
+            return 2.0
+        if ql in ("q8_0", "f8_e4m3", "fp8", "f8_e5m2"):
+            return 1.05
+        if ql in ("q4_0", "q4_1"):
+            return 0.56
+        return 1.05
+
+    # Hybrid DeltaNet/GQA models keep full attention KV on ~1/4 of layers (e.g. 10-12 layers)
+    # with GQA kv_heads=2..4, head_dim=256. Empirical RTX 5060 calibration:
+    # 35B/38B @ 8K q8_0 ~ 320 MiB, 16K f8_e4m3 ~ 620 MiB, 64K f8_e4m3 ~ 1450 MiB.
+    scale_factor = (_bpe(cache_k) + _bpe(cache_v)) / 2.1
+    base_per_8k_mb = 320.0 if model.block_count <= 40 else 380.0
+    if "122b" in model.model_name.lower() or (model.block_count == 48 and model.expert_count == 256):
+        base_per_8k_mb = 480.0
+    chunks = max(0.5, float(ctx_size) / 8192.0)
+    # Sublinear scaling past 16k due to hybrid recurrent layers occupying fixed state size
+    if chunks <= 2.0:
+        return round(base_per_8k_mb * chunks * scale_factor, 1)
+    return round(base_per_8k_mb * (2.0 + (chunks - 2.0) * 0.45) * scale_factor, 1)
+
+
+def compute_auto_plan(
+    hw: HardwareProfile,
+    model: ModelTopology,
+    ctx_size: int = 8192,
+    base_dir: Optional[Path] = None,
+    explicit_gpu_layers: Optional[int] = None,
+    explicit_vram_layer_cap: Optional[str] = None,
+    explicit_cache_type_k: Optional[str] = None,
+    explicit_cache_type_v: Optional[str] = None,
+    explicit_fp8_kv: Optional[bool] = None,
+) -> AutoTuneConfig:
+    """
+    v0.16.2 Model-Aware AutoTune Planner:
+      - Adaptive KV Cache: q8_0 for ctx <= 8192 (fastest short-ctx FlashAttn),
+        f8_e4m3 for ctx >= 16384 (~50% KV VRAM reduction without Q4_0 quality loss).
+      - Model-Aware GPU MoE Layer Placement:
+        * Computes actual expert_layer_vram_mb from GGUF metadata and available VRAM
+          after dense layers, KV budget, and 1024 MiB safety headroom.
+        * 35B-class (<= 45 GB, <= 40 layers): automatically places 6..8 MoE layers in VRAM
+          when headroom permits (utilizing idle ~3.5 GiB on 8 GiB GPUs).
+        * 38B/122B-class (> 45 GB or 48 layers): preserves safe <= 2 layer cap to avoid OOM.
+      - Never overrides explicit user --gpu-layers / --vram-layer-cap / KV flags.
+      - Neural MTP stays strictly OFF ('off', draft_n=0) by default.
+    """
+    base_cfg = solve_optimal_configuration(hw, model, base_dir=base_dir)
+    name_lower = model.model_name.lower()
+
+    is_122b = (model.block_count == 48 and model.expert_count == 256) or ("122b" in name_lower)
+    is_38b = (
+        (model.block_count >= 48 and model.expert_count >= 512)
+        or model.file_size_gb > 45.0
+        or "3.8" in name_lower
+        or "qwen38" in name_lower
+        or "flash-next" in name_lower
+    )
+    is_35b_class = (
+        not is_122b
+        and not is_38b
+        and model.is_moe
+        and model.file_size_gb <= 45.0
+        and model.block_count <= 40
+    )
+
+    # 1. Context-Based Adaptive KV Cache (Stage 0.3)
+    if explicit_cache_type_k is not None or explicit_cache_type_v is not None:
+        kv_k = explicit_cache_type_k or explicit_cache_type_v or ("q8_0" if ctx_size <= 8192 else "f8_e4m3")
+        kv_v = explicit_cache_type_v or explicit_cache_type_k or kv_k
+        kv_policy = "explicit"
+    elif explicit_fp8_kv is True:
+        kv_k = "f8_e4m3"
+        kv_v = "f8_e4m3"
+        kv_policy = "explicit_fp8"
+    elif explicit_fp8_kv is False:
+        kv_k = "q8_0" if ctx_size <= 32768 else "q4_0"
+        kv_v = "q8_0" if ctx_size <= 8192 else "q4_0"
+        kv_policy = "explicit_non_fp8"
+    elif ctx_size <= 8192:
+        kv_k = "q8_0"
+        kv_v = "q8_0"
+        kv_policy = "adaptive_short_q8_0"
+    else:
+        kv_k = "f8_e4m3"
+        kv_v = "f8_e4m3"
+        kv_policy = "adaptive_long_f8_e4m3"
+
+    # 2. Compute per-layer MoE VRAM size & safe headroom (1024 MiB)
+    dense_vram_mb = (
+        6200.0 if (is_122b and "mxfp4" in model.quant_type.lower())
+        else (4900.0 if is_122b else (3100.0 if is_38b else 2560.0))
+    )
+    kv_budget_mb = _estimate_kv_budget_mb(model, ctx_size, kv_k, kv_v)
+    safety_headroom_mb = 1024.0
+
+    meta_layer_mb = (float(model.expert_slice_bytes) * float(max(1, model.expert_count))) / (1024.0 * 1024.0)
+    size_layer_mb = max(0.0, (model.file_size_gb * 1024.0) - dense_vram_mb) / float(max(1, model.block_count))
+    if is_122b:
+        expert_layer_vram_mb = max(meta_layer_mb, 2372.0)
+    elif is_38b:
+        expert_layer_vram_mb = max(meta_layer_mb, size_layer_mb, 1450.0)
+    else:
+        expert_layer_vram_mb = max(256.0, max(meta_layer_mb, size_layer_mb))
+
+    avail_moe_vram_mb = max(0.0, hw.vram_free_mb - dense_vram_mb - kv_budget_mb - safety_headroom_mb)
+
+    # 3. Model-Based GPU Layer Placement (Stage 0.1)
+    explicit_cap_int: Optional[int] = None
+    if explicit_vram_layer_cap is not None:
+        cap_s = str(explicit_vram_layer_cap).strip().lower()
+        if cap_s.isdigit():
+            explicit_cap_int = int(cap_s)
+
+    if explicit_gpu_layers is not None:
+        gpu_layers = max(0, int(explicit_gpu_layers))
+        layer_policy = "explicit_user_override"
+    elif not hw.has_gpu or hw.vram_free_mb <= 2000.0:
+        gpu_layers = 0
+        layer_policy = "cpu_only_or_low_vram"
+    elif is_35b_class:
+        fitted = int(avail_moe_vram_mb // expert_layer_vram_mb)
+        # On 8 GiB class GPUs (~7000 MiB free), 35B (~356 MiB/layer) fits 6..8 MoE layers safely
+        if fitted >= 6:
+            gpu_layers = min(8, fitted)
+        elif fitted >= 2:
+            gpu_layers = fitted
+        else:
+            gpu_layers = max(0, fitted)
+        layer_policy = f"auto_35b_fit_{gpu_layers}L"
+    else:
+        # 38B (75.8 GB, 48L) & 122B: protect 8 GiB VRAM from OOM by capping at <= 2 layers
+        fitted = int(avail_moe_vram_mb // expert_layer_vram_mb)
+        if is_38b and hw.vram_free_mb >= 6400.0:
+            gpu_layers = 2
+        else:
+            gpu_layers = min(2, max(0, fitted))
+        layer_policy = f"auto_large_safe_cap_{gpu_layers}L"
+
+    if explicit_gpu_layers is None and explicit_cap_int is not None:
+        gpu_layers = min(gpu_layers, explicit_cap_int)
+        layer_policy = f"explicit_vram_cap_{gpu_layers}L"
+
+    if explicit_vram_layer_cap is not None and str(explicit_vram_layer_cap).strip() != "":
+        vram_layer_cap = str(explicit_vram_layer_cap).strip()
+    elif is_38b:
+        vram_layer_cap = "2"
+    else:
+        vram_layer_cap = "auto"
+
+    estimated_vram_peak_mb = round(
+        dense_vram_mb + kv_budget_mb + (gpu_layers * expert_layer_vram_mb) if hw.has_gpu else 0.0,
+        1,
+    )
+    vram_cache_mb = (
+        int(max(0.0, min(avail_moe_vram_mb - gpu_layers * expert_layer_vram_mb, 3200.0)))
+        if (hw.has_gpu and gpu_layers > 0)
+        else 0
+    )
+
+    # Heuristic TPS projection grounded in verified v0.16.1/v0.16.2 RTX 5060 + Ryzen 7 260 runs
+    if not hw.has_gpu:
+        est_tps = 18.0 if is_35b_class else 5.5
+    elif is_35b_class:
+        est_tps = round(82.0 + max(0, gpu_layers - 2) * 2.1, 1)
+    elif is_38b:
+        est_tps = 36.0 if gpu_layers >= 2 else 28.0
+    elif is_122b:
+        est_tps = 11.0
+    else:
+        est_tps = 45.0
+
+    rec_boost_level = 1 if (is_38b or is_122b) else base_cfg.boost_level
+
+    rationale = dict(base_cfg.rationale)
+    rationale.update({
+        "autotune_version": "0.16.3",
+        "expert_layer_vram_mb": round(expert_layer_vram_mb, 1),
+        "dense_vram_mb": round(dense_vram_mb, 1),
+        "kv_budget_mb": round(kv_budget_mb, 1),
+        "safety_headroom_mb": safety_headroom_mb,
+        "avail_moe_vram_mb": round(avail_moe_vram_mb, 1),
+        "estimated_vram_peak_mb": estimated_vram_peak_mb,
+        "estimated_decode_tps": est_tps,
+        "gpu_layer_policy": layer_policy,
+        "kv_policy": kv_policy,
+        "kv_cache": f"{kv_k}/{kv_v} ({kv_policy}, ctx={ctx_size})",
+        "vram_layer_cap": vram_layer_cap,
+        "boost_level": f"Level {rec_boost_level} ({'Quality-Safe 512E/122B' if rec_boost_level == 1 else 'Turbo'})",
+        "hot_ram_policy": (
+            "zero-copy-mlock (100% CPU MoE pinned in RAM)"
+            if (is_35b_class and hw.ram_avail_gb >= 14.0)
+            else (
+                "zero-copy-prewarm (prioritized CPU MoE pre-warmed in reclaimable Hot RAM)"
+                if is_35b_class
+                else "reclaimed-pagecache (GPU shadow eviction maximizes OS page cache)"
+            )
+        ),
+        "speculative": "OFF (MTP disabled by default; opt-in only)",
+    })
+
+    return AutoTuneConfig(
+        threads=base_cfg.threads,
+        gpu_layers=gpu_layers,
+        vram_cache_mb=vram_cache_mb if vram_cache_mb > 0 else base_cfg.vram_cache_mb,
+        moe_cache_mib=base_cfg.moe_cache_mib,
+        mtp_mode="off",
+        mtp_draft_n=0,
+        boost_level=rec_boost_level,
+        ctx_size=ctx_size,
+        physical_map_path=base_cfg.physical_map_path,
+        rationale=rationale,
+        prompt_cache_mb=base_cfg.prompt_cache_mb,
+        moe_cache_cpu_share=base_cfg.moe_cache_cpu_share,
+        ffn_chunk_size=base_cfg.ffn_chunk_size,
+        cache_type_k=kv_k,
+        cache_type_v=kv_v,
+        vram_layer_cap=vram_layer_cap,
+        ram_lock_policy=base_cfg.ram_lock_policy,
+    )
+
+
+def scan_local_models(
+    base_dir: Optional[Path] = None,
+    extra_dirs: Optional[List[str]] = None,
+    hw: Optional[HardwareProfile] = None,
+    ctx_size: int = 8192,
+) -> List[Dict[str, Any]]:
+    """
+    Discovers local GGUF models across repo models/, HuggingFace cache (Linux & Windows),
+    shared NTFS /mnt/Ortak/huggingface/hub, and optional user-specified directories.
+    Deduplicates multi-shard GGUF files (reporting shard 1 with aggregated size).
+    """
+    import re as _re
+
+    root = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parents[2]
+    search_dirs: List[Path] = [
+        root / "models",
+        Path.home() / ".cache" / "huggingface" / "hub",
+    ]
+    if os.name == "nt":
+        userprofile = os.environ.get("USERPROFILE")
+        if userprofile:
+            search_dirs.append(Path(userprofile) / ".cache" / "huggingface" / "hub")
+    else:
+        search_dirs.append(Path("/mnt/Ortak/huggingface/hub"))
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        search_dirs.append(Path(hf_home) / "hub")
+        search_dirs.append(Path(hf_home))
+
+    if extra_dirs:
+        for d in extra_dirs:
+            if d:
+                search_dirs.append(Path(d))
+
+    # Deduplicate search dirs while preserving order
+    unique_dirs: List[Path] = []
+    seen_dirs: set[str] = set()
+    for d in search_dirs:
+        try:
+            key = str(d.resolve()) if d.exists() else str(d)
+        except OSError:
+            key = str(d)
+        if key not in seen_dirs and d.is_dir():
+            seen_dirs.add(key)
+            unique_dirs.append(d)
+
+    if hw is None:
+        hw = probe_hardware()
+
+    shard_re = _re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", _re.IGNORECASE)
+    discovered: List[Dict[str, Any]] = []
+    seen_realpaths: set[str] = set()
+
+    for sdir in unique_dirs:
+        for dirpath, _dirnames, filenames in os.walk(sdir):
+            for fname in sorted(filenames):
+                if not fname.lower().endswith(".gguf"):
+                    continue
+                m_shard = shard_re.search(fname)
+                if m_shard and int(m_shard.group(1)) != 1:
+                    continue  # Skip non-first shards
+                fpath = Path(dirpath) / fname
+                try:
+                    real_key = str(fpath.resolve())
+                except OSError:
+                    real_key = str(fpath)
+                if real_key in seen_realpaths:
+                    continue
+                seen_realpaths.add(real_key)
+                try:
+                    topo = inspect_model_topology(fpath)
+                    plan = compute_auto_plan(hw, topo, ctx_size=ctx_size, base_dir=root)
+                    is_mtp_head = "mtp" in fname.lower() or "mtp" in str(fpath.parent).lower()
+                    discovered.append({
+                        "path": str(fpath),
+                        "name": topo.model_name,
+                        "filename": fname,
+                        "architecture": topo.architecture,
+                        "block_count": topo.block_count,
+                        "expert_count": topo.expert_count,
+                        "expert_used_count": topo.expert_used_count,
+                        "file_size_gb": topo.file_size_gb,
+                        "quant_type": topo.quant_type,
+                        "is_moe": topo.is_moe,
+                        "is_mtp_head": is_mtp_head,
+                        "shards": int(m_shard.group(2)) if m_shard else 1,
+                        "autotune": {
+                            "threads": plan.threads,
+                            "gpu_layers": plan.gpu_layers,
+                            "vram_cache_mb": plan.vram_cache_mb,
+                            "moe_cache_mib": plan.moe_cache_mib,
+                            "cache_type_k": plan.cache_type_k,
+                            "cache_type_v": plan.cache_type_v,
+                            "vram_layer_cap": plan.vram_layer_cap,
+                            "ram_lock_policy": plan.ram_lock_policy,
+                            "boost_level": plan.boost_level,
+                            "mtp_mode": plan.mtp_mode,
+                            "estimated_vram_peak_mb": plan.rationale.get("estimated_vram_peak_mb"),
+                            "estimated_decode_tps": plan.rationale.get("estimated_decode_tps"),
+                            "expert_layer_vram_mb": plan.rationale.get("expert_layer_vram_mb"),
+                            "gpu_layer_policy": plan.rationale.get("gpu_layer_policy"),
+                            "kv_policy": plan.rationale.get("kv_policy"),
+                        },
+                    })
+                except Exception:
+                    continue
+
+    # Primary non-MTP models first, sorted by size descending
+    discovered.sort(key=lambda item: (item["is_mtp_head"], -item["file_size_gb"], item["name"]))
+    return discovered
+
+
+
+def calibrate_moe_cache(
+    engine_exe: str,
+    model_path: str,
+    hw: HardwareProfile,
+    model: ModelTopology,
+    cache_candidates_mb: Optional[List[int]] = None,
+    share_candidates: Optional[List[float]] = None,
+    n_predict: int = 32,
+) -> Dict[str, Any]:
+    """PR #30966-inspired calibration sweep across (vram_cache_mb, cpu_share) pairs."""
+    import re, subprocess, time
+    if cache_candidates_mb is None:
+        max_safe = max(512, int(hw.vram_free_mb - (4900 if model.expert_count == 256 and model.block_count == 48 else 2900) - 768))
+        cache_candidates_mb = sorted({min(max_safe, v) for v in (512, 1024, 2048, 3200) if v <= max_safe or v == 512})
+    if share_candidates is None:
+        share_candidates = [0.0, 0.25, 0.5, 0.75, 0.95]
+
+    results = []
+    best = None
+    for cache_mb in cache_candidates_mb:
+        for share in share_candidates:
+            cmd = [
+                engine_exe,
+                "-m", model_path,
+                "-ngl", "99",
+                "--atlas-gpu-first",
+                "--atlas-gpu-layers", "0",
+                "--atlas-vram-cache", str(cache_mb),
+                "--atlas-moe-cache-cpu-share", f"{share:.2f}",
+                "-n", str(n_predict),
+                "-p", "Write a short Python binary search function.",
+            ]
+            t0 = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                dt = time.perf_counter() - t0
+                combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                m_gen = re.search(r"\[ATLAS\]\s+Generate:\s+\d+\s+tokens\s+/\s+[0-9.]+\s+s\s+=\s+([0-9.]+)\s+TPS", combined)
+                tps = float(m_gen.group(1)) if m_gen else ((n_predict / dt) if (proc.returncode == 0 and dt > 0) else 0.0)
+                entry = {"vram_cache_mb": cache_mb, "cpu_share": share, "tps": round(tps, 3), "ok": proc.returncode == 0}
+            except Exception as exc:
+                entry = {"vram_cache_mb": cache_mb, "cpu_share": share, "tps": 0.0, "ok": False, "error": str(exc)}
+            results.append(entry)
+            if entry["ok"] and (best is None or entry["tps"] > best["tps"]):
+                best = entry
+
+    return {"best": best, "trials": results}
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +1109,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Tendou AutoTune Diagnostic Tool")
     parser.add_argument("--model-path", type=str, default=None, help="Path to GGUF model")
+    parser.add_argument("--calibrate-moe-cache", action="store_true", help="Run PR #30966-style (vram_cache, cpu_share) sweep")
+    _exe_name = "tendou-engine.exe" if os.name == "nt" else "tendou-engine"
+    parser.add_argument("--engine-exe", type=str, default=str(Path(__file__).resolve().parents[2] / "releases" / "tendou-v0.16.3-stable" / "bin" / _exe_name), help="Path to tendou-engine binary")
     args = parser.parse_args()
 
     print("================================================================================")
@@ -666,10 +1125,11 @@ if __name__ == "__main__":
 
     m_path = args.model_path or os.environ.get("TENDOU_MODEL_PATH")
     if not m_path or not os.path.exists(m_path):
-        # Default to Qwen3.8 Flash Next or Qwen3.6 if available
+        repo_root = Path(__file__).resolve().parents[2]
+        p_linux = repo_root / "models" / "qwen3.8-gsq-rco-iq3_xxs" / "IQ3_XXS" / "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
         p1 = Path(r"C:\Users\Ali\WebProjects\tendou-launcher\models\qwen3.8-gsq-rco-iq3_xxs\IQ3_XXS\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf")
         p2 = Path(r"C:\Users\Ali\.cache\huggingface\hub\models--unsloth--Qwen3.6-35B-A3B-GGUF\snapshots\a483e9e6cbd595906af30beda3187c2663a1118c\Qwen3.6-35B-A3B-UD-IQ4_XS.gguf")
-        m_path = str(p1 if p1.exists() else p2)
+        m_path = str(p_linux if p_linux.exists() else (p1 if p1.exists() else p2))
 
     if os.path.exists(m_path):
         print(f"\nTarget Model : {m_path}")
@@ -690,3 +1150,13 @@ if __name__ == "__main__":
         print("Rationale:")
         for k, v in cfg.rationale.items():
             print(f"  - {k}: {v}")
+        print(f"KV Cache Type    : K={cfg.cache_type_k}, V={cfg.cache_type_v}")
+        print(f"CPU Share Policy : {cfg.moe_cache_cpu_share}")
+        print(f"FFN Chunk Size   : {cfg.ffn_chunk_size}")
+        print(f"VRAM Layer Cap   : {cfg.vram_layer_cap}")
+        print(f"RAM Lock Policy  : {cfg.ram_lock_policy}")
+        if args.calibrate_moe_cache:
+            print("\nRunning PR #30966-style MoE Cache + CPU Share calibration sweep...")
+            sweep = calibrate_moe_cache(args.engine_exe, m_path, hw, model)
+            import json
+            print(json.dumps(sweep, indent=2))

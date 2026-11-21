@@ -14,7 +14,9 @@ Geliştirme sürecinin derinlemesine analizi, mühendislik kararları ve Ar-Ge s
 ---
 
 ## 🛠️ Kullanıcı ve Entegrasyon Kılavuzları
-- 📘 [`USER_GUIDE.md`](USER_GUIDE.md): Tendou Launcher kapsamlı kurulum, konfigürasyon, API kullanımı, OpenCode entegrasyonu ve problem giderme kılavuzu.
+- 📘 [`KUBUNTU_USER_GUIDE.md`](KUBUNTU_USER_GUIDE.md): **Kubuntu 26.04 Kapsamlı Kullanıcı, Sunucu ve Ajan Kılavuzu** — Sunucu başlatma, `systemd`/`tmux` yönetimi, Claude Code CLI, OpenCode ve Cline (VS Code) doğrudan entegrasyonu ve performans püf noktaları.
+- 📘 [`USER_GUIDE.md`](USER_GUIDE.md): Tendou Launcher kapsamlı kurulum, konfigürasyon, API kullanımı, OpenCode entegrasyonu ve problem giderme kılavuzu (Windows/Genel).
+- 📘 [`articles/claude_code_and_opencode_integration_guide.md`](articles/claude_code_and_opencode_integration_guide.md): Claude Code, OpenCode ve Cline (NVIDIA NIM) üçlü-protokol mimarisi ve canlı donanım doğrulaması.
 
 ---
 

@@ -1,0 +1,86 @@
+{
+  "timestamp": "2026-11-19T10:16:56Z",
+  "results": [
+    {
+      "label": "35b_v0.14.0_boost_l2",
+      "exe": "releases/tendou-v0.14.0-stable/bin/tendou-engine",
+      "prefill_tps": 37.3,
+      "prefill_s": 4.209,
+      "decode_tps": 36.91,
+      "decode_s": 1.734,
+      "wall_s": 16.302
+    },
+    {
+      "label": "35b_v0.16.0_boost_l2",
+      "exe": "releases/tendou-v0.16.0-stable/bin/tendou-engine",
+      "prefill_tps": 34.72,
+      "prefill_s": 4.522,
+      "decode_tps": 13.46,
+      "decode_s": 4.754,
+      "wall_s": 21.089
+    },
+    {
+      "label": "35b_v0.16.1_boost_l2",
+      "exe": "releases/tendou-v0.16.1-stable/bin/tendou-engine",
+      "prefill_tps": 34.29,
+      "prefill_s": 4.579,
+      "decode_tps": 27.58,
+      "decode_s": 2.321,
+      "wall_s": 16.901
+    },
+    {
+      "label": "35b_v0.14.0_k5_nominal",
+      "exe": "releases/tendou-v0.14.0-stable/bin/tendou-engine",
+      "prefill_tps": 21.89,
+      "prefill_s": 7.171,
+      "decode_tps": 22.45,
+      "decode_s": 2.85,
+      "wall_s": 20.615
+    },
+    {
+      "label": "35b_v0.16.0_k5_nominal",
+      "exe": "releases/tendou-v0.16.0-stable/bin/tendou-engine",
+      "prefill_tps": 36.3,
+      "prefill_s": 4.325,
+      "decode_tps": 11.46,
+      "decode_s": 5.584,
+      "wall_s": 21.435
+    },
+    {
+      "label": "35b_v0.16.1_k5_nominal",
+      "exe": "releases/tendou-v0.16.1-stable/bin/tendou-engine",
+      "prefill_tps": 36.97,
+      "prefill_s": 4.247,
+      "decode_tps": 16.99,
+      "decode_s": 3.766,
+      "wall_s": 18.318
+    },
+    {
+      "label": "38b_v0.14.0_boost_l2",
+      "exe": "releases/tendou-v0.14.0-stable/bin/tendou-engine",
+      "prefill_tps": 16.46,
+      "prefill_s": 9.541,
+      "decode_tps": 8.04,
+      "decode_s": 3.978,
+      "wall_s": 18.884
+    },
+    {
+      "label": "38b_v0.16.0_boost_l2",
+      "exe": "releases/tendou-v0.16.0-stable/bin/tendou-engine",
+      "prefill_tps": 32.73,
+      "prefill_s": 4.797,
+      "decode_tps": 5.03,
+      "decode_s": 6.358,
+      "wall_s": 16.435
+    },
+    {
+      "label": "38b_v0.16.1_boost_l2",
+      "exe": "releases/tendou-v0.16.1-stable/bin/tendou-engine",
+      "prefill_tps": 31.53,
+      "prefill_s": 4.979,
+      "decode_tps": 9.92,
+      "decode_s": 3.225,
+      "wall_s": 13.527
+    }
+  ]
+}

@@ -54,29 +54,31 @@ def probe_hardware() -> HardwareProfile:
     vram_free_mb = 0.0
 
     try:
-        if is_win:
-            nvml = ctypes.CDLL("nvml.dll")
-            nvml.nvmlInit_v2()
-            handle = ctypes.c_void_p()
-            nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle))
+        nvml = ctypes.CDLL("nvml.dll" if is_win else "libnvidia-ml.so.1")
+        nvml.nvmlInit_v2()
+        handle = ctypes.c_void_p()
+        nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle))
 
-            # Name
-            name_buf = ctypes.create_string_buffer(64)
-            nvml.nvmlDeviceGetName(handle, name_buf, 64)
-            gpu_name = name_buf.value.decode("utf-8", errors="ignore")
+        # Name
+        name_buf = ctypes.create_string_buffer(64)
+        nvml.nvmlDeviceGetName(handle, name_buf, 64)
+        gpu_name = name_buf.value.decode("utf-8", errors="ignore")
 
-            # Memory
-            class Memory(ctypes.Structure):
-                _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+        # Memory
+        class Memory(ctypes.Structure):
+            _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
-            mem = Memory()
-            nvml.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem))
-            vram_total_mb = mem.total / (1024.0 * 1024.0)
-            vram_free_mb = mem.free / (1024.0 * 1024.0)
-            nvml.nvmlShutdown()
+        mem = Memory()
+        nvml.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem))
+        vram_total_mb = mem.total / (1024.0 * 1024.0)
+        vram_free_mb = mem.free / (1024.0 * 1024.0)
+        if vram_total_mb > 0:
             has_gpu = True
     except Exception:
-        # Fallback to nvidia-smi if NVML dll direct call fails
+        pass
+
+    if not has_gpu:
+        # Fallback to nvidia-smi if NVML library direct call fails
         try:
             res = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"],
@@ -105,11 +107,23 @@ def probe_hardware() -> HardwareProfile:
     has_avx2 = True  # Safe default on all modern x86_64
 
     try:
-        # Check through cpuinfo or environment hint
         cpu_str = platform.processor().lower() + " " + platform.machine().lower()
-        if "ryzen" in cpu_str or "intel" in cpu_str or "amd" in cpu_str:
+        if not is_win and os.path.exists("/proc/cpuinfo"):
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                cpuinfo = f.read().lower()
+            cpu_str += " " + cpuinfo
+            core_ids = set()
+            for line in cpuinfo.splitlines():
+                if line.startswith("core id"):
+                    core_ids.add(line.split(":", 1)[-1].strip())
+            if core_ids:
+                physical_cores = len(core_ids)
+        if "avx512_vnni" in cpu_str or "ryzen" in cpu_str or "intel" in cpu_str or "amd" in cpu_str:
             has_vnni = True
+        if "avx512vbmi" in cpu_str or "avx512_vbmi" in cpu_str or "ryzen" in cpu_str or "intel" in cpu_str or "amd" in cpu_str:
             has_vbmi = True
+        if "avx2" in cpu_str:
+            has_avx2 = True
     except Exception:
         pass
 
@@ -139,8 +153,18 @@ def probe_hardware() -> HardwareProfile:
             ram_avail_gb = stat.ullAvailPhys / (1024.0 ** 3)
         except Exception:
             pass
+    elif os.path.exists("/proc/meminfo"):
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        ram_total_gb = float(line.split()[1]) / (1024.0 * 1024.0)
+                    elif line.startswith("MemAvailable:"):
+                        ram_avail_gb = float(line.split()[1]) / (1024.0 * 1024.0)
+        except Exception:
+            pass
 
-    # 4. DirectStorage / Windows BypassIO
+    # 4. DirectStorage / Windows BypassIO / Linux NVMe Direct I/O
     ds_supported = False
     if is_win:
         try:
@@ -150,6 +174,13 @@ def probe_hardware() -> HardwareProfile:
                 ds_supported = True
         except Exception:
             pass
+    else:
+        try:
+            rel = platform.release().split(".", 2)
+            if int(rel[0]) >= 5:
+                ds_supported = True
+        except Exception:
+            ds_supported = True
 
     return HardwareProfile(
         has_gpu=has_gpu,
@@ -194,6 +225,11 @@ def inspect_model_topology(model_path: str | Path) -> ModelTopology:
         raise FileNotFoundError(f"Model file not found: {p}")
 
     file_size_gb = p.stat().st_size / (1024.0 ** 3)
+    if "-00001-of-" in p.name:
+        prefix = p.name.split("-00001-of-")[0]
+        shards = list(p.parent.glob(f"{prefix}-*-of-*.gguf"))
+        if shards:
+            file_size_gb = sum(s.stat().st_size for s in shards) / (1024.0 ** 3)
     name = p.stem
 
     # Defaults
@@ -207,7 +243,18 @@ def inspect_model_topology(model_path: str | Path) -> ModelTopology:
 
     # Fast heuristic check based on model file name if GGUF magic is valid
     name_lower = name.lower()
-    if "35b" in name_lower or "qwen3.6" in name_lower:
+    if "122b" in name_lower or "a10b" in name_lower:
+        block_count = 48
+        expert_count = 256
+        expert_used_count = 8
+        intermediate_size = 1024
+        if "mxfp4" in name_lower:
+            quant_type = "MXFP4_MOE"
+            expert_slice_bytes = 5505024
+        else:
+            quant_type = "Q6_K_P"
+            expert_slice_bytes = 7741440
+    elif "35b" in name_lower or "qwen3.6" in name_lower:
         block_count = 40
         expert_count = 256
         expert_used_count = 8
@@ -240,9 +287,19 @@ def inspect_model_topology(model_path: str | Path) -> ModelTopology:
                         key = f.read(k_len).decode("utf-8", errors="ignore")
                         val_type = struct.unpack("<I", f.read(4))[0]
 
-                        # Handle UINT32 / INT32 / STRING
+                        # Handle UINT32 / INT32 / UINT64 / INT64 / STRING
                         if val_type in (4, 5):  # UINT32, INT32
-                            val = struct.unpack("<I", f.read(4))[0]
+                            val = struct.unpack("<I" if val_type == 4 else "<i", f.read(4))[0]
+                            if "block_count" in key:
+                                block_count = val
+                            elif "expert_count" in key:
+                                expert_count = val
+                            elif "expert_used_count" in key:
+                                expert_used_count = val
+                            elif "intermediate_size" in key:
+                                intermediate_size = val
+                        elif val_type in (10, 11):  # UINT64, INT64
+                            val = struct.unpack("<Q" if val_type == 10 else "<q", f.read(8))[0]
                             if "block_count" in key:
                                 block_count = val
                             elif "expert_count" in key:
@@ -260,7 +317,7 @@ def inspect_model_topology(model_path: str | Path) -> ModelTopology:
                             f.read(1)
                         elif val_type in (2, 3):  # 2 bytes
                             f.read(2)
-                        elif val_type in (6, 10, 11, 12):  # 8 bytes
+                        elif val_type in (6, 12):  # 8 bytes (FLOAT32/64)
                             f.read(8)
                         elif val_type == 9:  # ARRAY
                             elem_type = struct.unpack("<I", f.read(4))[0]
@@ -335,8 +392,10 @@ def solve_optimal_configuration(
         threads = 4
 
     # 2. Dense Layers & VRAM Allocation (Tier-0)
-    # Estimate dense attention memory: ~2.5 GB for 35B/3.8, plus KV cache for 8192 ctx (~400 MB)
-    dense_vram_mb = 2560.0
+    # Estimate dense attention memory: ~6.2 GB for 122B MXFP4 (Q8_0 dense), ~4.9 GB for 122B Q6_K, ~2.5 GB for 35B/3.8, plus KV cache for 8192 ctx
+    is_122b = (model.block_count == 48 and model.expert_count == 256) or ("122b" in model.model_name.lower())
+    dense_vram_mb = 6200.0 if (is_122b and "mxfp4" in model.quant_type.lower()) else (4900.0 if is_122b else 2560.0)
+    layer_expert_mb = 2372.0 if is_122b else 900.0
     kv_cache_mb = 400.0
     vram_guard_mb = 512.0
 
@@ -345,11 +404,11 @@ def solve_optimal_configuration(
     moe_cache_mib = 0
 
     if hw.has_gpu and hw.vram_free_mb > 2000.0:
-        # Offload dense layers to GPU via -ngl 99; keep 0-2 MoE anchor layers in VRAM
-        # Deep MoE layers (2..N) stay CPU/RAM backed to prevent VRAM OOM on 8GB GPUs
+        # Offload dense layers to GPU via -ngl 99; keep 0-2 MoE anchor layers in VRAM only if capacity permits
+        # Deep MoE layers stay CPU/RAM backed to prevent VRAM OOM / WDDM PCIe thrashing on 8GB GPUs
         avail_vram_for_experts = max(0.0, hw.vram_free_mb - dense_vram_mb - kv_cache_mb - vram_guard_mb)
-        gpu_layers = 2 if avail_vram_for_experts >= 1800.0 else 0
-        vram_cache_mb = int(min(avail_vram_for_experts, 4096.0))
+        gpu_layers = 2 if avail_vram_for_experts >= (2.0 * layer_expert_mb) else 0
+        vram_cache_mb = int(min(avail_vram_for_experts, 4096.0)) if gpu_layers > 0 else 0
 
     # 3. Host RAM Pinning (Tier-1)
     # Reserve 2.5 GB for OS and application
@@ -359,49 +418,63 @@ def solve_optimal_configuration(
     # For 35B model: hot 34.4% experts = 4.85 GiB (~5120 MiB)
     # For Qwen3.8 Flash Next: hot cache budget ~5120-6144 MiB
     max_ram_cache_mib = int(avail_ram_gb * 1024.0)
-    moe_cache_mib = min(max_ram_cache_mib, 5120)
+    moe_cache_mib = 2048 if is_122b else min(max_ram_cache_mib, 5120)
 
     # 4. Multi-Turn Prefix State Cache (Prompt Caching)
     prompt_cache_mb = 512 if hw.ram_avail_gb >= 2.0 else 256
 
     # 5. Speculative Decoding Strategy (PLD vs Neural MTP)
     # Neural MTP requires ~2.2 GB VRAM for draft weights.
-    # If VRAM headroom after VRAM cache is tight (< 2400 MB), 0-VRAM PLD is strictly superior.
+    # On 122B+ models on laptop CPU/RAM, batch verification of drafts creates severe memory latency spikes;
+    # pure nominal autoregressive decoding (d*=0) gives 3.8+ TPS without batch latency penalties.
     remaining_vram_mb = hw.vram_free_mb - dense_vram_mb - vram_cache_mb
-    mtp_mode = "pld"
-    mtp_draft_n = 3
-
-    # Check for MTP model file
-    mtp_q4 = base_dir / "models" / "mtp" / "Qwen3.8-Flash-Next-MTP-Q4_0.gguf"
-    if remaining_vram_mb >= 2400.0 and mtp_q4.is_file() and "flash" in model.model_name.lower():
-        mtp_mode = "vram"
-        mtp_draft_n = 2
+    if is_122b:
+        mtp_mode = "off"
+        mtp_draft_n = 0
     else:
-        mtp_mode = "pld"
-        # On PLD, n=3 or n=4 gives tepe EV(d) as proven in Phase 11 horizon sweep
-        mtp_draft_n = 3
+        # Check for MTP model file
+        mtp_q4 = base_dir / "models" / "mtp" / "Qwen3.8-Flash-Next-MTP-Q4_0.gguf"
+        if remaining_vram_mb >= 2400.0 and mtp_q4.is_file() and "flash" in model.model_name.lower():
+            mtp_mode = "vram"
+            mtp_draft_n = 2
+        else:
+            mtp_mode = "pld"
+            # On PLD, n=3 or n=4 gives tepe EV(d) as proven in Phase 11 horizon sweep
+            mtp_draft_n = 3
 
     # 5. Physical Map Selection (4KB Fused Sektör Hizalı & Model Quant Uyumluluğu)
     physical_map_path = None
     if model.block_count == 40 and model.expert_count == 256:
         # Qwen3.6-35B
-        cand_35b = [
-            base_dir / "config" / "atlas_physical_map_35b_3tier.json",
-            base_dir / "config" / "atlas_physical_map_35b.json",
-            Path(r"C:\Users\Ali\WebProjects\tening\artifacts\phase11\atlas_physical_map_3tier_server.json"),
-        ]
+        if "iq4_xs" in model.quant_type.lower() or "iq4_xs" in model.model_name.lower() or "iq4xs" in model.model_name.lower():
+            cand_35b = [
+                base_dir / "config" / "atlas_physical_map_35b_iq4xs.json",
+                base_dir / "config" / "atlas_physical_map_35b_3tier.json",
+                base_dir / "config" / "atlas_physical_map_35b.json",
+            ]
+        else:
+            cand_35b = [
+                base_dir / "config" / "atlas_physical_map_35b_3tier.json",
+                base_dir / "config" / "atlas_physical_map_35b.json",
+                base_dir / "config" / "atlas_physical_map_35b_iq4xs.json",
+            ]
+        fallback_35b = None
         for c in cand_35b:
             if c.is_file():
+                if fallback_35b is None:
+                    fallback_35b = str(c)
                 try:
                     with open(c, "r", encoding="utf-8") as mf:
                         m_data = json.load(mf)
-                    # Check if map belongs to same quant or file
-                    m_file = m_data.get("file", {}).get("path", "")
-                    if model.quant_type.lower() in m_file.lower() or "35b" in m_file.lower():
+                    # Check if map belongs to same quant
+                    m_file = m_data.get("file", {}).get("path", "") or m_data.get("source", "")
+                    if model.quant_type.lower() in m_file.lower():
                         physical_map_path = str(c)
                         break
                 except Exception:
                     continue
+        if not physical_map_path and fallback_35b:
+            physical_map_path = fallback_35b
     elif model.block_count == 48 and model.expert_count == 512:
         # Qwen3.8 Flash Next
         cand_38 = [
@@ -417,6 +490,29 @@ def solve_optimal_configuration(
                     m_file = str(m_data)
                     # Only accept if quant matches (prevent Q5_K_S map on IQ3_XXS model)
                     if model.quant_type.lower() in m_file.lower():
+                        physical_map_path = str(c)
+                        break
+                except Exception:
+                    continue
+    elif model.block_count == 48 and model.expert_count == 256:
+        # Qwen3.5-122B-A10B
+        if "mxfp4" in model.quant_type.lower() or "mxfp4" in model.model_name.lower():
+            cand_122b = [
+                base_dir / "config" / "atlas_physical_map_122b_mxfp4.json",
+                base_dir / "config" / "atlas_physical_map_122b.json",
+            ]
+        else:
+            cand_122b = [
+                base_dir / "config" / "atlas_physical_map_122b_q6k.json",
+                base_dir / "config" / "atlas_physical_map_122b.json",
+            ]
+        for c in cand_122b:
+            if c.is_file():
+                try:
+                    with open(c, "r", encoding="utf-8") as mf:
+                        m_data = json.load(mf)
+                    m_file = str(m_data)
+                    if model.quant_type.lower() in m_file.lower() or "122b" in m_file.lower():
                         physical_map_path = str(c)
                         break
                 except Exception:

@@ -66,6 +66,27 @@ docs/agent-history.md
 .context/
 **/.context/
 
+# Local Tendou Studio profile & persistent user chat histories
+config/studio_profile.json
+data/chats/
+
+# Frontend & Tauri v2 Desktop build dependencies / artifacts (ui/dist/ stays tracked)
+ui/node_modules/
+desktop/src-tauri/target/
+*.AppImage
+*.deb
+*.msi
+*.nsis
+*.rpm
+
+# Agent tooling, knowledge graph & vault caches (EXCLUDED)
+.agents/
+**/.agents/
+.obsidian/
+**/.obsidian/
+graphify-out/
+**/graphify-out/
+
 # Models, weights, state caches and model-specific checkpoints (EXCLUDED)
 models/
 models/**
